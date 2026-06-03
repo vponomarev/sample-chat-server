@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+.git/
+.gitignore
+.nessy/
+*.md
+!requirements*.txt
+.pytest_cache/
+.coverage
+htmlcov/
+data/*.db
+*.log

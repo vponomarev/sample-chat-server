@@ -1,0 +1,53 @@
+groups:
+  - name: chat_cluster_alerts
+    interval: 30s
+    rules:
+      # Master down alert
+      - alert: ClusterMasterDown
+        expr: cluster_is_master == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Cluster Master is down"
+          description: "No master node detected in the cluster for more than 1 minute"
+
+      # High replication lag
+      - alert: HighReplicationLag
+        expr: cluster_replication_lag > 100
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High replication lag on {{ $labels.instance }}"
+          description: "Replication lag is {{ $value }} entries (threshold: 100)"
+
+      # No connected clients
+      - alert: NoConnectedClients
+        expr: irc_connected_users == 0
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "No connected clients on {{ $labels.instance }}"
+          description: "Server {{ $labels.instance }} has no connected clients for 5 minutes"
+
+      # Server down
+      - alert: ServerDown
+        expr: up{job=~"chat-server-.*"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Chat server {{ $labels.instance }} is down"
+          description: "Server {{ $labels.instance }} has been down for more than 1 minute"
+
+      # High message rate
+      - alert: HighMessageRate
+        expr: rate(irc_messages_total[5m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High message rate on {{ $labels.instance }}"
+          description: "Message rate is {{ $value }} msg/sec (threshold: 100)"

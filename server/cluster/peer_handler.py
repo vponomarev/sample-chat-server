@@ -1,0 +1,170 @@
+"""
+Peer handler - HTTP handlers для общения между серверами кластера.
+"""
+
+import json
+import logging
+from aiohttp import web
+
+from cluster.election import BullyElection
+from cluster.replication import WALReplication
+from cluster.heartbeat import HeartbeatManager
+
+
+def setup_cluster_routes(app: web.Application):
+    """Настройка маршрутов для кластера."""
+    
+    # Health check с информацией о кластере
+    app.router.add_get("/cluster/health", handle_cluster_health)
+    
+    # Election endpoints
+    app.router.add_post("/cluster/election/start", handle_election_start)
+    app.router.add_post("/cluster/election/coordinator", handle_coordinator)
+    
+    # Replication endpoints
+    app.router.add_post("/cluster/replication/wal", handle_wal_replication)
+    app.router.add_get("/cluster/replication/sync", handle_wal_sync)
+    
+    # Cluster state
+    app.router.add_get("/cluster/state", handle_cluster_state)
+
+
+async def handle_cluster_health(request: web.Request) -> web.Response:
+    """Health check с информацией о кластере."""
+    cluster = request.app.get("cluster")
+    
+    if not cluster:
+        return web.json_response({
+            "status": "ok",
+            "role": "master",
+            "term": 0,
+            "uptime": 0
+        })
+    
+    election_state = cluster.election.get_state() if cluster.election else {}
+    
+    return web.json_response({
+        "status": "ok",
+        "server_id": cluster.server_id,
+        "role": election_state.get("role", "slave"),
+        "term": election_state.get("term", 0),
+        "master_id": election_state.get("master_id"),
+        "uptime": int(cluster.uptime) if hasattr(cluster, 'uptime') else 0
+    })
+
+
+async def handle_election_start(request: web.Request) -> web.Response:
+    """Обработка начала выборов от другого сервера."""
+    cluster = request.app.get("cluster")
+    
+    if not cluster or not cluster.election:
+        return web.json_response({"ok": False}, status=503)
+    
+    data = await request.json()
+    candidate_id = data.get("candidate_id")
+    term = data.get("term", 0)
+    
+    logging.info(f"[Cluster] Получен ELECTION от {candidate_id} (term={term})")
+    
+    # Запускаем свои выборы
+    await cluster.election.start_election()
+    
+    return web.json_response({
+        "ok": True,
+        "term": cluster.election.state.current_term,
+        "server_id": cluster.server_id
+    })
+
+
+async def handle_coordinator(request: web.Request) -> web.Response:
+    """Обработка сообщения о новом master."""
+    cluster = request.app.get("cluster")
+    
+    if not cluster or not cluster.election:
+        return web.json_response({"received": False}, status=503)
+    
+    data = await request.json()
+    master_id = data.get("master_id")
+    term = data.get("term", 0)
+    
+    logging.info(f"[Cluster] Получен COORDINATOR: master={master_id} (term={term})")
+    
+    # Обновляем состояние
+    if term >= cluster.election.state.current_term:
+        cluster.election.state.current_term = term
+        cluster.election.state.master_id = master_id
+        cluster.election.state.is_master = (master_id == cluster.server_id)
+        cluster.election.state.election_in_progress = False
+        
+        # Обновляем режим репликации
+        if cluster.replication:
+            cluster.replication.set_master(cluster.election.state.is_master)
+    
+    return web.json_response({"received": True})
+
+
+async def handle_wal_replication(request: web.Request) -> web.Response:
+    """Получение WAL записей от master."""
+    cluster = request.app.get("cluster")
+    
+    if not cluster or not cluster.replication:
+        return web.json_response({"ack": False}, status=503)
+    
+    data = await request.json()
+    entries = data.get("entries", [])
+    
+    logging.debug(f"[Cluster] Получено WAL записей: {len(entries)}")
+    
+    acked = []
+    for entry in entries:
+        success = await cluster.replication.apply_wal_entry(entry)
+        if success:
+            acked.append(entry.get("seq"))
+    
+    return web.json_response({
+        "ack": True,
+        "acked_seqs": acked
+    })
+
+
+async def handle_wal_sync(request: web.Request) -> web.Response:
+    """Синхронизация WAL для отстающих slave."""
+    cluster = request.app.get("cluster")
+    
+    if not cluster or not cluster.replication:
+        return web.json_response({"entries": []}, status=503)
+    
+    if not cluster.replication.is_master:
+        return web.json_response(
+            {"error": "Not master"},
+            status=403
+        )
+    
+    after_seq = int(request.query.get("after_seq", 0))
+    
+    entries = await cluster.replication.get_wal_entries(after_seq)
+    
+    return web.json_response({
+        "entries": [e.to_dict() for e in entries],
+        "count": len(entries)
+    })
+
+
+async def handle_cluster_state(request: web.Request) -> web.Response:
+    """Получение состояния кластера."""
+    cluster = request.app.get("cluster")
+    
+    if not cluster:
+        return web.json_response({"error": "Cluster not initialized"}, status=503)
+    
+    state = {
+        "server_id": cluster.server_id,
+        "election": cluster.election.get_state() if cluster.election else {},
+        "heartbeat": cluster.heartbeat.get_cluster_state() if cluster.heartbeat else {},
+        "replication": {
+            "is_master": cluster.replication.is_master if cluster.replication else False,
+            "lag": cluster.replication.get_lag() if cluster.replication else 0
+        } if cluster.replication else {}
+    }
+    
+    return web.json_response(state)

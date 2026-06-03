@@ -1,0 +1,22 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "alerts.yml"
+
+scrape_configs:
+  - job_name: 'chat-server-1'
+    static_configs:
+      - targets: ['server1:8080']
+    metrics_path: '/metrics'
+
+  - job_name: 'chat-server-2'
+    static_configs:
+      - targets: ['server2:8080']
+    metrics_path: '/metrics'
+
+  - job_name: 'chat-server-3'
+    static_configs:
+      - targets: ['server3:8080']
+    metrics_path: '/metrics'

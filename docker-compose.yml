@@ -1,0 +1,131 @@
+version: '3.8'
+
+services:
+  # Сервер 1 (Master по умолчанию)
+  server1:
+    build: .
+    container_name: chat-server1
+    environment:
+      - SERVER_ID=server1
+      - CHAT_PORT=8080
+      - PEERS=server2:8081,server3:8082
+      - CLUSTER_ENABLED=true
+      - HOST=0.0.0.0
+      - DB_PATH=/app/data/chat.db
+    volumes:
+      - server1_data:/app/data
+    ports:
+      - "8080:8080"
+    networks:
+      - chat-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Сервер 2
+  server2:
+    build: .
+    container_name: chat-server2
+    environment:
+      - SERVER_ID=server2
+      - CHAT_PORT=8080
+      - PEERS=server1:8080,server3:8082
+      - CLUSTER_ENABLED=true
+      - HOST=0.0.0.0
+      - DB_PATH=/app/data/chat.db
+    volumes:
+      - server2_data:/app/data
+    ports:
+      - "8081:8080"
+    networks:
+      - chat-network
+    depends_on:
+      server1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Сервер 3
+  server3:
+    build: .
+    container_name: chat-server3
+    environment:
+      - SERVER_ID=server3
+      - CHAT_PORT=8080
+      - PEERS=server1:8080,server2:8081
+      - CLUSTER_ENABLED=true
+      - HOST=0.0.0.0
+      - DB_PATH=/app/data/chat.db
+    volumes:
+      - server3_data:/app/data
+    ports:
+      - "8082:8080"
+    networks:
+      - chat-network
+    depends_on:
+      server1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: chat-prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9090:9090"
+    networks:
+      - chat-network
+    depends_on:
+      - server1
+      - server2
+      - server3
+
+  # Grafana
+  grafana:
+    image: grafana/grafana:latest
+    container_name: chat-grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    ports:
+      - "3000:3000"
+    networks:
+      - chat-network
+    depends_on:
+      - prometheus
+
+networks:
+  chat-network:
+    driver: bridge
+
+volumes:
+  server1_data:
+  server2_data:
+  server3_data:
+  prometheus_data:
+  grafana_data:

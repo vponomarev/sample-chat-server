@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sample Chat</title>
+    <link rel="stylesheet" href="css/style.css">
+    <link rel="manifest" href="manifest.json">
+    <meta name="theme-color" content="#2c3e50">
+</head>
+<body>
+    <div id="app">
+        <!-- Экран входа/регистрации -->
+        <div id="auth-screen" class="screen">
+            <button id="auth-settings-btn" class="auth-settings-btn" title="Настройки сервера">⚙️ Настройки сервера</button>
+            <div class="auth-container">
+                <h1>Sample Chat</h1>
+                <div class="auth-tabs">
+                    <button class="tab-btn active" data-tab="login">Вход</button>
+                    <button class="tab-btn" data-tab="register">Регистрация</button>
+                </div>
+                
+                <form id="login-form" class="auth-form">
+                    <input type="text" id="login-nick" placeholder="Ник" required>
+                    <input type="password" id="login-password" placeholder="Пароль (опционально)">
+                    <button type="submit">Войти</button>
+                </form>
+                
+                <form id="register-form" class="auth-form hidden">
+                    <input type="text" id="register-nick" placeholder="Ник" required>
+                    <input type="password" id="register-password" placeholder="Пароль (опционально)">
+                    <button type="submit">Зарегистрироваться</button>
+                </form>
+                
+                <div id="auth-error" class="error-message hidden"></div>
+            </div>
+        </div>
+        
+        <!-- Основной экран чата -->
+        <div id="chat-screen" class="screen hidden">
+            <header class="chat-header">
+                <div class="header-left">
+                    <span id="connection-status" class="status status-disconnected">🔴 Офлайн</span>
+                    <span id="current-nick" class="nick-display"></span>
+                </div>
+                <div class="header-right">
+                    <button id="settings-btn" class="icon-btn" title="Настройки сервера">⚙️</button>
+                    <button id="logout-btn" class="logout-btn">Выйти</button>
+                </div>
+            </header>
+            
+            <div class="chat-container">
+                <!-- Сайдбар с комнатами -->
+                <aside class="sidebar">
+                    <div class="rooms-section">
+                        <div class="section-header">
+                            <h3>Комнаты</h3>
+                            <button id="create-room-btn" class="icon-btn" title="Создать комнату">+</button>
+                        </div>
+                        <ul id="room-list" class="room-list"></ul>
+                    </div>
+                    
+                    <div class="users-section">
+                        <h3>Участники</h3>
+                        <ul id="user-list" class="user-list"></ul>
+                    </div>
+                </aside>
+                
+                <!-- Область сообщений -->
+                <main class="messages-area">
+                    <div id="room-header" class="room-header">
+                        <span id="current-room">#general</span>
+                    </div>
+                    <div id="messages-container" class="messages-container"></div>
+                    <form id="message-form" class="message-form">
+                        <input type="text" id="message-input" placeholder="Введите сообщение..." autocomplete="off">
+                        <button type="submit">Send</button>
+                    </form>
+                </main>
+            </div>
+            
+            <!-- Индикатор очереди сообщений -->
+            <div id="queue-indicator" class="queue-indicator">
+                <span>⏳</span>
+                <span id="queue-count">0</span>
+                <span>в очереди</span>
+            </div>
+        </div>
+        
+        <!-- Модальное окно создания комнаты -->
+        <div id="create-room-modal" class="modal hidden">
+            <div class="modal-content">
+                <h3>Создать комнату</h3>
+                <input type="text" id="new-room-name" placeholder="Название комнаты (например, #random)">
+                <div class="modal-actions">
+                    <button id="cancel-create-room" class="btn-secondary">Отмена</button>
+                    <button id="confirm-create-room" class="btn-primary">Создать</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Модальное окно настроек сервера -->
+        <div id="server-settings-modal" class="modal hidden">
+            <div class="modal-content">
+                <h3>Настройки сервера</h3>
+                <div class="settings-form">
+                    <div class="form-group">
+                        <label for="server-host">Хост сервера</label>
+                        <input type="text" id="server-host" placeholder="localhost" value="localhost">
+                    </div>
+                    <div class="form-group">
+                        <label for="server-port">Порт</label>
+                        <input type="number" id="server-port" placeholder="8080" value="8080" min="1" max="65535">
+                    </div>
+                    <div class="form-group">
+                        <label>
+                            <input type="checkbox" id="server-autoconnect">
+                            Автоподключение при запуске
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <small class="help-text">
+                            Для stand-alone режима оставьте поля пустыми — приложение будет работать локально.
+                        </small>
+                    </div>
+                </div>
+                <div class="modal-actions">
+                    <button id="cancel-settings" class="btn-secondary">Отмена</button>
+                    <button id="save-settings" class="btn-primary">Сохранить</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script src="js/storage.js"></script>
+    <script src="js/connection.js"></script>
+    <script src="js/commands.js"></script>
+    <script src="js/rooms.js"></script>
+    <script src="js/messages.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>
