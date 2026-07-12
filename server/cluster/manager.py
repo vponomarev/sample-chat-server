@@ -21,6 +21,11 @@ from observability.metrics import (
     update_peers_alive
 )
 
+# Порог отставания реплики (в записях WAL), до которого узел ещё считается
+# готовым. Небольшой люфт терпит кратковременный лаг, но узел, реально
+# догоняющий журнал, отсекается из readiness.
+READINESS_MAX_LAG = 5
+
 
 class ClusterManager:
     """
@@ -339,3 +344,36 @@ class ClusterManager:
                 }
 
         return None
+
+    def get_readiness(self) -> Dict:
+        """
+        Готовность узла принимать трафик (readiness) — отдельно от liveness.
+
+        Liveness = «процесс жив» (отвечает на запрос). Readiness = «узлу можно
+        слать клиентов». Отставший или ещё выбирающий мастера узел жив, но не
+        готов: направлять на него клиентов рано (реплика с большим lag отдаст
+        устаревшие данные, а узел без мастера не примет запись). Это та самая
+        практика liveness/readiness из Kubernetes.
+
+        Правила:
+          * master — всегда готов (обслуживает запись);
+          * slave без известного мастера (идут выборы) — не готов;
+          * slave, отставший по WAL больше порога (догоняет) — не готов;
+          * иначе — готов.
+        """
+        role = "master" if self.is_master else "slave"
+
+        if self.is_master:
+            return {"ready": True, "role": role, "reason": "master"}
+
+        if not self.get_master_server():
+            return {"ready": False, "role": role, "reason": "master unknown (election in progress)"}
+
+        lag = self.replication.get_lag() if self.replication else 0
+        if lag > READINESS_MAX_LAG:
+            return {
+                "ready": False, "role": role, "lag": lag,
+                "max_lag": READINESS_MAX_LAG, "reason": "catching up WAL",
+            }
+
+        return {"ready": True, "role": role, "lag": lag, "reason": "in sync"}

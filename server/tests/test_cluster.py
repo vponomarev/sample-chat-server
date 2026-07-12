@@ -617,3 +617,60 @@ class TestClusterAuth:
         from cluster.auth import auth_headers, CLUSTER_TOKEN_HEADER
         assert auth_headers("s3cret") == {CLUSTER_TOKEN_HEADER: "s3cret"}
         assert auth_headers("") == {}
+
+
+class TestReadiness:
+    """Готовность узла (readiness) отдельно от liveness — issue 3.4."""
+
+    def _manager(self):
+        from cluster.manager import ClusterManager
+        from aiohttp import web
+        return ClusterManager(
+            app=web.Application(), server_id="server1",
+            host="localhost", port=8081, peers=[], db_connection=None,
+        )
+
+    def test_master_is_ready(self):
+        m = self._manager()
+        m.election = MagicMock()
+        m.election.state.is_master = True
+        info = m.get_readiness()
+        assert info["ready"] is True
+        assert info["role"] == "master"
+
+    def test_slave_without_master_not_ready(self):
+        """Пока идут выборы (мастер неизвестен) — узел не готов."""
+        m = self._manager()
+        m.election = MagicMock()
+        m.election.state.is_master = False
+        m.heartbeat = MagicMock()
+        m.heartbeat.get_master.return_value = None
+        info = m.get_readiness()
+        assert info["ready"] is False
+        assert "master unknown" in info["reason"]
+
+    def test_slave_lagging_not_ready(self):
+        """Реплика, отставшая по WAL больше порога, — не готова (догоняет)."""
+        from cluster.manager import READINESS_MAX_LAG
+        m = self._manager()
+        m.election = MagicMock()
+        m.election.state.is_master = False
+        m.heartbeat = MagicMock()  # get_master() вернёт правдоподобный объект
+        m.replication = MagicMock()
+        m.replication.get_lag.return_value = READINESS_MAX_LAG + 10
+        info = m.get_readiness()
+        assert info["ready"] is False
+        assert info["reason"] == "catching up WAL"
+        assert info["lag"] == READINESS_MAX_LAG + 10
+
+    def test_slave_in_sync_ready(self):
+        """Реплика, знающая мастера и почти без отставания, — готова."""
+        m = self._manager()
+        m.election = MagicMock()
+        m.election.state.is_master = False
+        m.heartbeat = MagicMock()
+        m.replication = MagicMock()
+        m.replication.get_lag.return_value = 0
+        info = m.get_readiness()
+        assert info["ready"] is True
+        assert info["role"] == "slave"

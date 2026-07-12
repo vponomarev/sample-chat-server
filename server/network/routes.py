@@ -65,8 +65,12 @@ def setup_routes(app: web.Application):
     # WebSocket endpoint
     app.router.add_get("/ws", websocket_handler)
 
-    # Health check
+    # Health checks: liveness (процесс жив) и readiness (готов к трафику).
+    # /health оставлен как liveness ради обратной совместимости (docker-compose,
+    # скрипты). /health/live — явный синоним, /health/ready — готовность.
     app.router.add_get("/health", health_check)
+    app.router.add_get("/health/live", liveness_check)
+    app.router.add_get("/health/ready", readiness_check)
 
     # Prometheus метрики
     app.router.add_get("/metrics", metrics_endpoint)
@@ -88,8 +92,31 @@ def setup_routes(app: web.Application):
 
 
 async def health_check(request: web.Request) -> web.Response:
-    """Health check endpoint."""
+    """Liveness (обратная совместимость): процесс жив и отвечает."""
     return web.json_response({"status": "ok"})
+
+
+async def liveness_check(request: web.Request) -> web.Response:
+    """
+    Liveness: жив ли процесс. Если обработчик выполнился — событийный цикл
+    отвечает; тело фиксированное. Оркестратор по 200 понимает «не перезапускать».
+    """
+    return web.json_response({"status": "alive"})
+
+
+async def readiness_check(request: web.Request) -> web.Response:
+    """
+    Readiness: готов ли узел принимать трафик. 200 — готов, 503 — нет
+    (например, реплика догоняет WAL или идут выборы мастера). Балансировщик
+    по 503 временно выводит узел из ротации, не убивая его.
+    """
+    cluster = request.app.get("cluster")
+    if not cluster:
+        # Одиночный сервер: готов, как только отвечает.
+        return web.json_response({"ready": True, "role": "standalone"})
+
+    info = cluster.get_readiness()
+    return web.json_response(info, status=200 if info["ready"] else 503)
 
 
 async def metrics_endpoint(request: web.Request) -> web.Response:

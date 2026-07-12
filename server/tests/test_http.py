@@ -36,6 +36,24 @@ class TestHealthEndpoint:
         data = await resp.json()
         assert data["status"] == "ok"
 
+    @pytest.mark.asyncio
+    async def test_liveness(self, http_client):
+        """Liveness отвечает 200, пока процесс жив."""
+        resp = await http_client.get("/health/live")
+
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["status"] == "alive"
+
+    @pytest.mark.asyncio
+    async def test_readiness_standalone(self, http_client):
+        """Одиночный сервер (без кластера) сразу готов."""
+        resp = await http_client.get("/health/ready")
+
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["ready"] is True
+
 
 class TestMetricsEndpoint:
     """Тесты metrics endpoint."""
