@@ -32,10 +32,29 @@ async def cors_middleware(request: web.Request, handler):
     return response
 
 
+CLIENT_DIR = Path(__file__).parent.parent.parent / "client"
+
+
 async def serve_index(request: web.Request) -> web.Response:
     """Отдача index.html."""
-    static_path = Path(__file__).parent.parent.parent / "client" / "index.html"
-    return web.FileResponse(static_path)
+    return web.FileResponse(CLIENT_DIR / "index.html")
+
+
+async def serve_client_root_file(request: web.Request) -> web.Response:
+    """
+    Отдача файлов, которые должны лежать в корне сайта: sw.js и manifest.json.
+    Service Worker обязан отдаваться из корня, иначе его scope='/' не сработает.
+    """
+    name = Path(request.path).name  # "sw.js" | "manifest.json"
+    path = CLIENT_DIR / name
+    if not path.is_file():
+        return web.Response(status=404)
+    return web.FileResponse(path)
+
+
+async def serve_favicon(request: web.Request) -> web.Response:
+    """Иконка вкладки — переиспользуем PWA-иконку."""
+    return web.FileResponse(CLIENT_DIR / "icons" / "icon-192.png")
 
 
 def setup_routes(app: web.Application):
@@ -55,12 +74,17 @@ def setup_routes(app: web.Application):
     # Список серверов (для кластера)
     app.router.add_get("/api/servers", get_servers)
 
-    # Статика (клиент)
-    static_path = Path(__file__).parent.parent.parent / "client"
-    if static_path.exists():
-        # Добавляем индекс по умолчанию
+    # Статика клиента — по путям, которые ждёт index.html (js/, css/, icons/,
+    # manifest.json, sw.js). Ссылки в index.html относительные, поэтому
+    # разрешаются в /js/…, /css/…, /manifest.json от корня.
+    if CLIENT_DIR.exists():
         app.router.add_get("/", serve_index)
-        app.router.add_static("/static/", static_path, show_index=False)
+        app.router.add_get("/sw.js", serve_client_root_file)
+        app.router.add_get("/manifest.json", serve_client_root_file)
+        app.router.add_get("/favicon.ico", serve_favicon)
+        app.router.add_static("/js/", CLIENT_DIR / "js", show_index=False)
+        app.router.add_static("/css/", CLIENT_DIR / "css", show_index=False)
+        app.router.add_static("/icons/", CLIENT_DIR / "icons", show_index=False)
 
 
 async def health_check(request: web.Request) -> web.Response:

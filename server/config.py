@@ -1,17 +1,59 @@
-"""Конфигурация сервера."""
+"""Конфигурация сервера.
 
+Значения берутся из ``config/config.yaml`` (базовые настройки), а переменные
+окружения их переопределяют. Такой порядок удобен: файл — читаемые дефолты для
+разработки, env — переопределение в Docker/кластере.
+"""
+
+import logging
 import os
 from pathlib import Path
 
+import yaml
+
 # Путь к корню проекта
 PROJECT_ROOT = Path(__file__).parent.parent
+CONFIG_FILE = PROJECT_ROOT / "config" / "config.yaml"
 
-# Сервер
-HOST = os.getenv("CHAT_HOST", "0.0.0.0")
-PORT = int(os.getenv("CHAT_PORT", 8080))
+
+def _load_yaml() -> dict:
+    """Читает config/config.yaml. При отсутствии/ошибке — пустой конфиг."""
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:  # некорректный YAML не должен ронять сервер
+        logging.warning("Не удалось прочитать %s: %s", CONFIG_FILE, e)
+        return {}
+
+
+_YAML = _load_yaml()
+_SRV = _YAML.get("server", {})
+_DB = _YAML.get("database", {})
+_LOG = _YAML.get("logging", {})
+_CLUSTER = _YAML.get("cluster", {})
+
+
+def _resolve_db_path(raw: str) -> str:
+    """Относительный путь из YAML разрешаем от корня проекта."""
+    p = Path(raw)
+    if not p.is_absolute():
+        p = PROJECT_ROOT / p
+    return str(p)
+
+
+# Сервер (env > yaml > умолчание)
+HOST = os.getenv("CHAT_HOST", _SRV.get("host", "0.0.0.0"))
+PORT = int(os.getenv("CHAT_PORT", _SRV.get("port", 8080)))
 
 # База данных
-DB_PATH = os.getenv("CHAT_DB_PATH", str(PROJECT_ROOT / "data" / "chat.db"))
+_DEFAULT_DB = _resolve_db_path(_DB["path"]) if _DB.get("path") else str(PROJECT_ROOT / "data" / "chat.db")
+DB_PATH = os.getenv("CHAT_DB_PATH", _DEFAULT_DB)
+
+# Логирование
+LOG_LEVEL = os.getenv("LOG_LEVEL", _LOG.get("level", "INFO"))
+LOG_FORMAT = os.getenv("LOG_FORMAT", _LOG.get("format", "json"))
 
 # Имя сервера (для кластера)
 SERVER_ID = os.getenv("SERVER_ID", "server1")
@@ -19,24 +61,59 @@ SERVER_NAME = os.getenv("SERVER_NAME", SERVER_ID)
 
 # Кластер (Фаза 3)
 CLUSTER_ENABLED = os.getenv("CLUSTER_ENABLED", "false").lower() == "true"
-PEERS = os.getenv("PEERS", "")  # Формат: "server2:8080,server3:8080"
+# Формат: "server2@host:port,server3@host:port" — ID соседа указывается явно.
+PEERS = os.getenv("PEERS", "")
+
+# Общий секрет для аутентификации межсерверного трафика (issue #10).
+# Все узлы кластера должны знать один и тот же секрет. Пусто → управляющие
+# кластерные endpoint'ы открыты (сервер предупредит об этом при старте).
+# В проде задаётся через env CLUSTER_SECRET, а не хранится в репозитории.
+CLUSTER_SECRET = os.getenv("CLUSTER_SECRET", _CLUSTER.get("secret", ""))
+
 
 def parse_peers(peers_str: str) -> list:
-    """Парсинг строки пиров."""
+    """
+    Парсинг списка пиров из строки.
+
+    Основной формат — с явным ID: ``id@host:port`` (например
+    ``server2@localhost:8082``). ID соседа берётся из конфигурации, а не
+    угадывается по позиции — это важно для Bully-выборов, где лидер
+    определяется по числовому ID.
+    """
     if not peers_str:
         return []
-    
+
     peers = []
-    for peer in peers_str.split(","):
+    for i, peer in enumerate(peers_str.split(",")):
         peer = peer.strip()
-        if ":" in peer:
-            host, port = peer.rsplit(":", 1)
-            peers.append({
-                "host": host,
-                "port": int(port),
-                "server_id": f"server{len(peers) + 2}"  # server2, server3, ...
-            })
+        if not peer:
+            continue
+
+        if "@" in peer:
+            server_id, addr = peer.split("@", 1)
+            server_id = server_id.strip()
+        else:
+            # Обратная совместимость со старым форматом host:port без ID.
+            # ID приходится угадывать — это ненадёжно, поэтому предупреждаем.
+            addr = peer
+            server_id = f"server{i + 2}"
+            logging.warning(
+                "PEERS: у пира '%s' не указан ID (формат id@host:port); "
+                "использую предполагаемый '%s'", peer, server_id
+            )
+
+        if ":" not in addr:
+            logging.warning("PEERS: пропускаю некорректный адрес пира: '%s'", peer)
+            continue
+
+        host, port = addr.rsplit(":", 1)
+        peers.append({
+            "host": host.strip(),
+            "port": int(port),
+            "server_id": server_id,
+        })
     return peers
+
 
 PEERS_LIST = parse_peers(PEERS)
 
@@ -60,5 +137,8 @@ def get_config() -> dict:
         "ws_heartbeat_interval": WS_HEARTBEAT_INTERVAL,
         "ws_heartbeat_timeout": WS_HEARTBEAT_TIMEOUT,
         "cluster_enabled": CLUSTER_ENABLED,
+        "cluster_secret": CLUSTER_SECRET,
         "peers": PEERS_LIST,
+        "log_level": LOG_LEVEL,
+        "log_format": LOG_FORMAT,
     }

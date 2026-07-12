@@ -31,7 +31,9 @@ class ServerInfo:
     
     @property
     def health_url(self) -> str:
-        return f"{self.url}/health"
+        # /cluster/health отдаёт role/term/master_id/uptime — без этого сосед
+        # не знает роль пира и не может обнаружить падение master.
+        return f"{self.url}/cluster/health"
 
 
 class HeartbeatManager:
@@ -44,11 +46,13 @@ class HeartbeatManager:
         port: int,
         peers: List[Dict],
         on_peer_down=None,
-        on_peer_up=None
+        on_peer_up=None,
+        secret: str = ""
     ):
         self.server_id = server_id
         self.host = host
         self.port = port
+        self.secret = secret
         self.start_time = time.time()
         
         # Список пиров
@@ -83,7 +87,11 @@ class HeartbeatManager:
     async def start(self):
         """Запуск heartbeat цикла."""
         self._running = True
-        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5))
+        from cluster.auth import auth_headers
+        self._session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=5),
+            headers=auth_headers(self.secret),
+        )
         self._task = asyncio.create_task(self._heartbeat_loop())
         logging.info("[Heartbeat] Запущен")
     

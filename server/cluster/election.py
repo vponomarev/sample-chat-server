@@ -43,11 +43,13 @@ class BullyElection:
         peers: List[Dict],
         on_become_master: Optional[Callable] = None,
         on_become_slave: Optional[Callable] = None,
-        on_master_changed: Optional[Callable] = None
+        on_master_changed: Optional[Callable] = None,
+        secret: str = ""
     ):
         self.server_id = server_id
         self.host = host
         self.port = port
+        self.secret = secret
         
         # Пирсы
         self.peers = {
@@ -64,15 +66,24 @@ class BullyElection:
         self.state = ElectionState()
         self._session: Optional[aiohttp.ClientSession] = None
         self._running = False
-        
+
+        # Источник живых пиров с большим ID (инъектируется из ClusterManager,
+        # опирается на heartbeat). Если не задан — считаем всех пиров живыми.
+        self._alive_higher_source: Optional[Callable] = None
+
         # Таймауты
         self.election_timeout = 3.0  # секунды ожидания ответа на выборы
         self.coordinator_timeout = 2.0  # секунды на рассылку coordinator
-        
-        # HTTP сессия для election сообщений
-        self._http_app: Optional = None  # aiohttp application для входящих запросов
-        
+
         logging.info(f"[Election] Инициализирован для {server_id}")
+
+    def set_liveness_source(self, source: Callable):
+        """
+        Задаёт источник живых пиров с большим ID (обычно
+        ``heartbeat.get_alive_peers_with_higher_id``). Возвращает список
+        объектов с атрибутом ``server_id``.
+        """
+        self._alive_higher_source = source
     
     @property
     def numeric_id(self) -> int:
@@ -94,29 +105,24 @@ class BullyElection:
     
     async def start(self, http_app):
         """Запуск election менеджера."""
-        self._http_app = http_app
-        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5))
+        from cluster.auth import auth_headers
+        self._session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=5),
+            headers=auth_headers(self.secret),
+        )
         self._running = True
-        
-        # Регистрируем handlers для входящих election запросов
-        self._register_routes()
-        
+
+        # Входящие election-запросы обслуживают роуты /cluster/election/*
+        # (регистрируются в peer_handler.setup_cluster_routes и делегируют сюда).
         logging.info(f"[Election] Запущен (role={self.role}, term={self.term})")
-    
+
     async def stop(self):
         """Остановка election менеджера."""
         self._running = False
         if self._session:
             await self._session.close()
         logging.info("[Election] Остановлен")
-    
-    def _register_routes(self):
-        """Регистрация HTTP routes для election."""
-        if self._http_app:
-            self._http_app.router.add_post("/election/start", self.handle_election_start)
-            self._http_app.router.add_post("/election/ok", self.handle_election_ok)
-            self._http_app.router.add_post("/election/coordinator", self.handle_coordinator)
-    
+
     async def start_election(self):
         """Начало выборов."""
         if self.state.election_in_progress:
@@ -168,7 +174,7 @@ class BullyElection:
     async def _send_election_message(self, peer: Dict) -> bool:
         """Отправка ELECTION сообщения пиру."""
         try:
-            url = f"http://{peer['host']}:{peer['port']}/election/start"
+            url = f"http://{peer['host']}:{peer['port']}/cluster/election/start"
             async with self._session.post(
                 url,
                 json={
@@ -192,33 +198,40 @@ class BullyElection:
         term = data.get("term", 0)
         
         logging.debug(f"[Election] Получен ELECTION от {candidate_id} (term={term})")
-        
-        # Если термин выше - обновляем
+
+        if not self._running:
+            return web.json_response({"ok": False}, status=503)
+
+        # Принимаем более высокий term (кандидат мог уйти вперёд из-за
+        # повторных выборов). Это важно, чтобы наш ответный COORDINATOR нёс
+        # term >= term кандидата и был им принят.
         if term > self.state.current_term:
             self.state.current_term = term
             self.state.voted_for = None
-            self.state.is_master = False
-        
-        # Отвечаем OK (мы живы и можем участвовать)
-        if self._running:
-            # Начинаем свои выборы
-            asyncio.create_task(self.start_election())
-            
+
+        # Если мы уже master — не уступаем лидерство, а переподтверждаем его,
+        # рассылая COORDINATOR (в т.ч. на текущем, возможно поднятом, term).
+        # Без этого «мечущийся» узел бесконечно перезапускал бы выборы.
+        if self.state.is_master:
+            asyncio.create_task(self._broadcast_coordinator())
             return web.json_response({
                 "ok": True,
                 "term": self.state.current_term,
-                "server_id": self.server_id
+                "server_id": self.server_id,
+                "is_master": True,
             })
-        
-        return web.json_response({"ok": False}, status=503)
-    
-    async def handle_election_ok(self, request) -> aiohttp.web.Response:
-        """Обработка OK ответа."""
-        from aiohttp import web
-        
-        data = await request.json()
-        logging.debug(f"[Election] Получен OK от {data.get('server_id')}")
-        return web.json_response({"received": True})
+
+        # Иначе — отвечаем OK и запускаем свои выборы (Bully: у нас ID больше,
+        # чем у кандидата, значит шанс стать master есть). Не плодим выборы,
+        # если они уже идут.
+        if not self.state.election_in_progress:
+            asyncio.create_task(self.start_election())
+
+        return web.json_response({
+            "ok": True,
+            "term": self.state.current_term,
+            "server_id": self.server_id
+        })
     
     async def handle_coordinator(self, request) -> aiohttp.web.Response:
         """Обработка COORDINATOR сообщения (новый master)."""
@@ -245,6 +258,17 @@ class BullyElection:
         
         return web.json_response({"received": True})
     
+    async def step_down(self):
+        """
+        Сложить полномочия master и перевыбраться. Вызывается при обнаружении
+        живого master с большим ID (разрешение split-brain после гонок старта).
+        """
+        if self.state.is_master:
+            logging.warning(f"[Election] {self.server_id} слагает полномочия master")
+            self.state.is_master = False
+            self.state.master_id = None
+        await self.start_election()
+
     async def _become_master(self):
         """Стать master."""
         self.state.is_master = True
@@ -278,7 +302,7 @@ class BullyElection:
     async def _send_coordinator_to_peer(self, peer: Dict):
         """Отправка COORDINATOR пиру."""
         try:
-            url = f"http://{peer['host']}:{peer['port']}/election/coordinator"
+            url = f"http://{peer['host']}:{peer['port']}/cluster/election/coordinator"
             async with self._session.post(
                 url,
                 json={
@@ -294,8 +318,11 @@ class BullyElection:
     
     def _get_higher_alive_peers(self) -> List[str]:
         """Получение ID живых пиров с большим ID."""
-        # В простой версии считаем всех пиров живыми
-        # Heartbeat менеджер предоставит актуальную информацию
+        # Актуальную живость даёт heartbeat (инъектируется через
+        # set_liveness_source). Иначе — деградируем к «все пиры живы».
+        if self._alive_higher_source is not None:
+            return [p.server_id for p in self._alive_higher_source()]
+
         return [
             pid for pid in self.peers.keys()
             if pid != self.server_id and self._get_numeric_id(pid) > self.numeric_id

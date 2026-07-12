@@ -13,6 +13,7 @@ from cluster.heartbeat import HeartbeatManager
 from cluster.election import BullyElection
 from cluster.replication import WALReplication
 from cluster.peer_handler import setup_cluster_routes
+from cluster.auth import make_cluster_auth_middleware
 from observability.metrics import (
     update_cluster_is_master,
     update_replication_lag,
@@ -33,7 +34,8 @@ class ClusterManager:
         host: str,
         port: int,
         peers: List[Dict],
-        db_connection
+        db_connection,
+        secret: str = ""
     ):
         self.app = app
         self.server_id = server_id
@@ -41,6 +43,7 @@ class ClusterManager:
         self.port = port
         self.db = db_connection
         self.peers = peers
+        self.secret = secret
         self.start_time = time.time()
 
         # Компоненты
@@ -64,12 +67,39 @@ class ClusterManager:
     def is_master(self) -> bool:
         return self.election.state.is_master if self.election else False
 
+    @staticmethod
+    def _numeric_id(server_id: str) -> int:
+        try:
+            return int(server_id.replace("server", ""))
+        except (ValueError, AttributeError):
+            return 0
+
+    def _higher_master_alive(self) -> bool:
+        """Есть ли живой master с большим ID (признак split-brain)."""
+        my = self._numeric_id(self.server_id)
+        return any(
+            p.is_alive and p.role == "master" and self._numeric_id(p.server_id) > my
+            for p in self.heartbeat.peers.values()
+        )
+
     async def start(self):
         """Запуск кластера."""
         logging.info("[Cluster] Запуск...")
 
         # Настройка маршрутов
         setup_cluster_routes(self.app)
+
+        # Аутентификация межсерверного трафика (issue #10).
+        # Навешиваем middleware только если задан секрет; иначе громко
+        # предупреждаем — открытые управляющие endpoint'ы это анти-паттерн.
+        if self.secret:
+            self.app.middlewares.append(make_cluster_auth_middleware(self.secret))
+            logging.info("[Cluster] Межсерверный трафик защищён общим секретом")
+        else:
+            logging.warning(
+                "[Cluster] CLUSTER_SECRET не задан — управляющие endpoint'ы "
+                "(/cluster/election/*, /cluster/replication/*) не аутентифицированы"
+            )
 
         # Инициализация heartbeat
         self.heartbeat = HeartbeatManager(
@@ -78,7 +108,8 @@ class ClusterManager:
             port=self.port,
             peers=self.peers,
             on_peer_down=self._on_peer_down,
-            on_peer_up=self._on_peer_up
+            on_peer_up=self._on_peer_up,
+            secret=self.secret
         )
 
         # Инициализация election
@@ -89,16 +120,28 @@ class ClusterManager:
             peers=self.peers,
             on_become_master=self._on_become_master,
             on_become_slave=self._on_become_slave,
-            on_master_changed=self._on_master_changed
+            on_master_changed=self._on_master_changed,
+            secret=self.secret
         )
 
-        # Инициализация replication
+        # Инициализация replication.
+        # Начинаем как slave: право писать в WAL даст только победа в выборах
+        # (election → _on_become_master → replication.set_master(True)).
         self.replication = WALReplication(
             server_id=self.server_id,
             db_connection=self.db,
-            is_master=True,  # Начинаем как master, election определит
-            peers=self.peers
+            is_master=False,
+            peers=self.peers,
+            secret=self.secret
         )
+
+        # Выборы опираются на актуальную живость пиров из heartbeat
+        self.election.set_liveness_source(
+            self.heartbeat.get_alive_peers_with_higher_id
+        )
+
+        # Репликация знает, у кого догонять WAL (текущий master)
+        self.replication.set_master_locator(self.get_master_server)
 
         # Запуск компонентов
         await self.heartbeat.start()
@@ -156,6 +199,25 @@ class ClusterManager:
                 else:
                     update_replication_lag(0, self.server_id)
 
+                # Страховочная проверка живости master: если мы не master,
+                # выборы не идут и живого master нет — инициируем выборы.
+                # Дополняет реактивный триггер в _on_peer_down.
+                if (
+                    self.election
+                    and self.heartbeat
+                    and not self.is_master
+                    and not self.election.state.election_in_progress
+                    and not self.heartbeat.is_master_alive()
+                ):
+                    logging.info("[Cluster] Master не обнаружен — запуск выборов")
+                    await self.election.start_election()
+
+                # Разрешение split-brain: если мы master, но виден живой master
+                # с большим ID (например, после гонки при старте) — уступаем.
+                if self.is_master and self.heartbeat and self._higher_master_alive():
+                    logging.warning("[Cluster] Обнаружен master с большим ID — уступаем")
+                    await self.election.step_down()
+
                 await asyncio.sleep(5)
             except asyncio.CancelledError:
                 break
@@ -199,6 +261,9 @@ class ClusterManager:
 
         if self.replication:
             self.replication.set_master(False)
+            # Догоняем WAL у master (best-effort; разрывы также закрываются
+            # автоматически при получении WAL с пропуском seq)
+            await self.replication.sync_from_master()
 
         # Уведомляем клиентов о смене master
         await self._notify_clients_master_changed()

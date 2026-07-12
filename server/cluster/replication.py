@@ -7,7 +7,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Callable
 from dataclasses import dataclass, field
 
 import aiohttp
@@ -62,53 +62,52 @@ class WALReplication:
         server_id: str,
         db_connection: Connection,
         is_master: bool = False,
-        peers: List[Dict] = None
+        peers: List[Dict] = None,
+        secret: str = ""
     ):
         self.server_id = server_id
         self.db = db_connection
         self.is_master = is_master
         self.peers = peers or []
+        self.secret = secret
         
         # Состояние
         self._last_applied_seq = 0
-        self._pending_acks: Dict[int, asyncio.Event] = {}
+        self._last_master_seq = 0  # максимальный seq, известный от master (для lag)
         self._session: Optional[aiohttp.ClientSession] = None
         self._running = False
-        
-        # Для slave - очередь получения записей
-        self._wal_queue: asyncio.Queue = asyncio.Queue()
-        self._apply_task: Optional[asyncio.Task] = None
-        
+        self._syncing = False  # флаг, чтобы не запускать несколько догонов сразу
+
+        # Локатор master (инъектируется из ClusterManager) для запроса догона
+        self._master_locator: Optional[Callable] = None
+
         logging.info(f"[WAL] Инициализирован для {server_id} (master={is_master})")
+
+    def set_master_locator(self, locator: Callable):
+        """Задаёт функцию, возвращающую dict master-сервера {host, port} (или None)."""
+        self._master_locator = locator
     
     async def start(self):
         """Запуск репликации."""
-        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+        from cluster.auth import auth_headers
+        self._session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=10),
+            headers=auth_headers(self.secret),
+        )
         self._running = True
         
         # Получаем последний применённый seq
         await self._load_last_seq()
-        
-        if not self.is_master:
-            # Slave запускает задачу применения WAL
-            self._apply_task = asyncio.create_task(self._apply_wal_loop())
-        
+
         logging.info(f"[WAL] Запущен (last_seq={self._last_applied_seq})")
-    
+
     async def stop(self):
         """Остановка репликации."""
         self._running = False
-        
-        if self._apply_task:
-            self._apply_task.cancel()
-            try:
-                await self._apply_task
-            except asyncio.CancelledError:
-                pass
-        
+
         if self._session:
             await self._session.close()
-        
+
         logging.info("[WAL] Остановлен")
     
     async def _load_last_seq(self):
@@ -198,8 +197,7 @@ class WALReplication:
     async def _send_wal_to_peer(self, peer: Dict, entry: Dict):
         """Отправка WAL записи пиру."""
         try:
-            # WebSocket для репликации (будет реализован в peer_handler)
-            url = f"http://{peer['host']}:{peer['port']}/replication/wal"
+            url = f"http://{peer['host']}:{peer['port']}/cluster/replication/wal"
             async with self._session.post(
                 url,
                 json=entry,
@@ -232,18 +230,39 @@ class WALReplication:
     # === Slave методы ===
     
     async def apply_wal_entry(self, entry: Dict) -> bool:
-        """Применение WAL записи (для slave)."""
+        """
+        Применение WAL записи (для slave) строго по порядку seq.
+
+        Порядок важен: сообщения ссылаются на комнаты/пользователей (внешние
+        ключи), поэтому применяем только следующую по счёту запись. Разрыв
+        (пропущен seq) означает потерянную запись — не двигаем указатель, а
+        догоняем через /replication/sync, чтобы ничего не потерять (#12).
+        """
         try:
             wal_entry = WALEntry.from_dict(entry)
-            
-            # Пропускаем если уже применено
+
+            # Отслеживаем максимальный seq мастера (для метрики lag)
+            if wal_entry.seq > self._last_master_seq:
+                self._last_master_seq = wal_entry.seq
+
+            # Уже применено (дубль/старое) — пропускаем
             if wal_entry.seq <= self._last_applied_seq:
                 logging.debug(f"[WAL] Пропущена запись seq={wal_entry.seq} (уже применено)")
                 return True
-            
-            # Применяем операцию
+
+            # Разрыв: пришло не следующее по счёту — догоняем и не теряем запись
+            if wal_entry.seq != self._last_applied_seq + 1:
+                logging.warning(
+                    f"[WAL] Разрыв: получено seq={wal_entry.seq}, "
+                    f"ожидалось {self._last_applied_seq + 1} — запуск догона"
+                )
+                await self._sync_if_possible()
+                # Если догон закрыл разрыв — запись уже применена
+                return wal_entry.seq <= self._last_applied_seq
+
+            # Контиг: применяем следующую запись
             await self._apply_operation(wal_entry)
-            
+
             # Обновляем last_applied_seq
             self._last_applied_seq = wal_entry.seq
             await self.db.execute(
@@ -251,14 +270,32 @@ class WALReplication:
                 (str(self._last_applied_seq),)
             )
             await self.db.commit()
-            
+
             logging.debug(f"[WAL] Применена запись: seq={wal_entry.seq}, op={wal_entry.operation}")
-            
+
             return True
-            
+
         except Exception as e:
             logging.error(f"[WAL] Ошибка применения записи: {e}")
             return False
+
+    async def _sync_if_possible(self):
+        """Догон недостающих WAL-записей у master (best-effort, без гонок)."""
+        if self._syncing or not self._master_locator:
+            return
+        master = self._master_locator()
+        if not master:
+            logging.debug("[WAL] Догон отложен: master неизвестен")
+            return
+        self._syncing = True
+        try:
+            await self.request_sync(f"http://{master['host']}:{master['port']}")
+        finally:
+            self._syncing = False
+
+    async def sync_from_master(self):
+        """Публичный запуск догона (например, при становлении slave)."""
+        await self._sync_if_possible()
     
     async def _apply_operation(self, entry: WALEntry):
         """Применение операции к базе данных."""
@@ -291,8 +328,10 @@ class WALReplication:
             )
         elif table == "messages":
             await self.db.execute(
-                "INSERT OR REPLACE INTO messages (msg_id, room, nick, text, ts) VALUES (?, ?, ?, ?, ?)",
-                (data["msg_id"], data["room"], data["nick"], data["text"], data["ts"])
+                "INSERT OR REPLACE INTO messages "
+                "(msg_id, room, nick, text, ts, client_msg_id) VALUES (?, ?, ?, ?, ?, ?)",
+                (data["msg_id"], data["room"], data["nick"], data["text"],
+                 data["ts"], data.get("client_msg_id"))
             )
         
         await self.db.commit()
@@ -307,12 +346,26 @@ class WALReplication:
         elif table == "rooms":
             await self.db.execute("DELETE FROM rooms WHERE name = ?", (data["name"],))
         elif table == "room_members":
-            await self.db.execute(
-                "DELETE FROM room_members WHERE room = ? AND nick = ?",
-                (data["room"], data["nick"])
-            )
+            # Либо конкретный участник (leave), либо все участники комнаты (delete_room)
+            if "nick" in data:
+                await self.db.execute(
+                    "DELETE FROM room_members WHERE room = ? AND nick = ?",
+                    (data["room"], data["nick"])
+                )
+            else:
+                await self.db.execute(
+                    "DELETE FROM room_members WHERE room = ?", (data["room"],)
+                )
         elif table == "messages":
-            await self.db.execute("DELETE FROM messages WHERE msg_id = ?", (data["msg_id"],))
+            # Либо одно сообщение, либо все сообщения комнаты (delete_room)
+            if "msg_id" in data:
+                await self.db.execute(
+                    "DELETE FROM messages WHERE msg_id = ?", (data["msg_id"],)
+                )
+            else:
+                await self.db.execute(
+                    "DELETE FROM messages WHERE room = ?", (data["room"],)
+                )
         
         await self.db.commit()
     
@@ -321,22 +374,10 @@ class WALReplication:
         # Заглушка для будущих UPDATE операций
         pass
     
-    async def _apply_wal_loop(self):
-        """Цикл применения WAL записей (для slave)."""
-        while self._running:
-            try:
-                entry = await self._wal_queue.get()
-                await self.apply_wal_entry(entry)
-                self._wal_queue.task_done()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logging.error(f"[WAL] Ошибка в цикле применения: {e}")
-    
     async def request_sync(self, master_url: str) -> bool:
         """Запрос синхронизации с master (при подключении slave)."""
         try:
-            url = f"{master_url}/replication/sync?after_seq={self._last_applied_seq}"
+            url = f"{master_url}/cluster/replication/sync?after_seq={self._last_applied_seq}"
             async with self._session.get(url, raise_for_status=True) as response:
                 data = await response.json()
                 entries = data.get("entries", [])
@@ -352,36 +393,10 @@ class WALReplication:
             return False
     
     def get_lag(self) -> int:
-        """Получение отставания репликации (для метрик)."""
-        # В простой версии возвращаем 0
-        # В полной - разница между last master seq и last_applied_seq
-        return 0
+        """Отставание репликации: сколько записей master ещё не применено."""
+        return max(0, self._last_master_seq - self._last_applied_seq)
     
     def set_master(self, is_master: bool):
         """Установка режима master/slave."""
         self.is_master = is_master
         logging.info(f"[WAL] Режим изменён: master={is_master}")
-
-
-class WALWriter:
-    """
-    Обёртка для записи операций с автоматическим логированием в WAL.
-    Используется на master.
-    """
-    
-    def __init__(self, replication: WALReplication):
-        self.replication = replication
-    
-    async def insert(self, table: str, data: Dict):
-        """INSERT с WAL логированием."""
-        seq = await self.replication.log_operation("INSERT", table, data)
-        return seq
-    
-    async def delete(self, table: str, key_field: str, key_value: Any):
-        """DELETE с WAL логированием."""
-        seq = await self.replication.log_operation(
-            "DELETE",
-            table,
-            {key_field: key_value}
-        )
-        return seq

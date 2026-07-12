@@ -54,53 +54,25 @@ async def handle_cluster_health(request: web.Request) -> web.Response:
 
 
 async def handle_election_start(request: web.Request) -> web.Response:
-    """Обработка начала выборов от другого сервера."""
+    """Обработка начала выборов — делегируется в BullyElection."""
     cluster = request.app.get("cluster")
-    
+
     if not cluster or not cluster.election:
         return web.json_response({"ok": False}, status=503)
-    
-    data = await request.json()
-    candidate_id = data.get("candidate_id")
-    term = data.get("term", 0)
-    
-    logging.info(f"[Cluster] Получен ELECTION от {candidate_id} (term={term})")
-    
-    # Запускаем свои выборы
-    await cluster.election.start_election()
-    
-    return web.json_response({
-        "ok": True,
-        "term": cluster.election.state.current_term,
-        "server_id": cluster.server_id
-    })
+
+    # Вся логика Bully (обработка term, ответ OK, запуск своих выборов)
+    # живёт в одном месте — BullyElection, чтобы не расходиться.
+    return await cluster.election.handle_election_start(request)
 
 
 async def handle_coordinator(request: web.Request) -> web.Response:
-    """Обработка сообщения о новом master."""
+    """Обработка сообщения о новом master — делегируется в BullyElection."""
     cluster = request.app.get("cluster")
-    
+
     if not cluster or not cluster.election:
         return web.json_response({"received": False}, status=503)
-    
-    data = await request.json()
-    master_id = data.get("master_id")
-    term = data.get("term", 0)
-    
-    logging.info(f"[Cluster] Получен COORDINATOR: master={master_id} (term={term})")
-    
-    # Обновляем состояние
-    if term >= cluster.election.state.current_term:
-        cluster.election.state.current_term = term
-        cluster.election.state.master_id = master_id
-        cluster.election.state.is_master = (master_id == cluster.server_id)
-        cluster.election.state.election_in_progress = False
-        
-        # Обновляем режим репликации
-        if cluster.replication:
-            cluster.replication.set_master(cluster.election.state.is_master)
-    
-    return web.json_response({"received": True})
+
+    return await cluster.election.handle_coordinator(request)
 
 
 async def handle_wal_replication(request: web.Request) -> web.Response:

@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from irc.commands import CommandHandler
-from network.ws_manager import WebSocketHandler
+from network.ws_manager import ConnectionRegistry
 
 
 class TestCommandHandler:
@@ -384,3 +384,171 @@ class TestCommandHandler:
 
         assert response["event"] == "USER_LIST"
         assert "room" in response
+
+    @pytest.mark.asyncio
+    async def test_msg_idempotent_duplicate(self, handler, mock_ws, database):
+        """Повтор с тем же client_msg_id не создаёт дубль в БД."""
+        import time
+
+        await database.execute(
+            "INSERT INTO users (nick, password, created_at) VALUES (?, ?, ?)",
+            ("sender", None, int(time.time()))
+        )
+        await database.commit()
+
+        handler.ws_manager.sessions[mock_ws] = {"nick": "sender", "authenticated": True}
+        handler.ws_manager.connections.add(mock_ws)
+        handler.ws_manager.room_connections["#general"] = {mock_ws}
+
+        payload = {"room": "#general", "text": "Hello!", "client_msg_id": "dup-1"}
+
+        # Первая отправка
+        await handler.handle_msg(mock_ws, payload)
+        # Повтор (как будто клиент не получил ACK и переслал)
+        await handler.handle_msg(mock_ws, payload)
+
+        # В БД должна быть ровно одна запись
+        row = await database.fetchone(
+            "SELECT COUNT(*) AS c FROM messages WHERE client_msg_id = ?", ("dup-1",)
+        )
+        assert row["c"] == 1
+
+        # Второй ACK помечен как duplicate и msg_id совпадает с первым
+        acks = [
+            json.loads(c[0][0]) for c in mock_ws.send_str.call_args_list
+            if json.loads(c[0][0]).get("event") == "ACK"
+        ]
+        assert len(acks) == 2
+        assert acks[1].get("duplicate") is True
+        assert acks[0]["msg_id"] == acks[1]["msg_id"]
+
+    @pytest.mark.asyncio
+    async def test_msg_too_long(self, handler, mock_ws, database):
+        """Слишком длинное сообщение отклоняется без вставки."""
+        import time
+        from irc.commands import MAX_MESSAGE_LEN
+
+        await database.execute(
+            "INSERT INTO users (nick, password, created_at) VALUES (?, ?, ?)",
+            ("sender", None, int(time.time()))
+        )
+        await database.commit()
+
+        handler.ws_manager.sessions[mock_ws] = {"nick": "sender", "authenticated": True}
+        handler.ws_manager.connections.add(mock_ws)
+
+        await handler.handle_msg(mock_ws, {
+            "room": "#general",
+            "text": "x" * (MAX_MESSAGE_LEN + 1),
+        })
+
+        call_args = mock_ws.send_str.call_args
+        response = json.loads(call_args[0][0])
+        assert response["event"] == "ERROR"
+        assert "too long" in response["message"]
+
+        row = await database.fetchone("SELECT COUNT(*) AS c FROM messages")
+        assert row["c"] == 0
+
+    @pytest.mark.asyncio
+    async def test_register_nick_too_long(self, handler, mock_ws):
+        """Слишком длинный ник отклоняется при регистрации."""
+        from irc.commands import MAX_NICK_LEN
+
+        await handler.handle_register(mock_ws, {
+            "nick": "n" * (MAX_NICK_LEN + 1),
+            "password": "pass123",
+        })
+
+        call_args = mock_ws.send_str.call_args
+        response = json.loads(call_args[0][0])
+        assert response["event"] == "ERROR"
+        assert "too long" in response["message"]
+
+    @pytest.mark.asyncio
+    async def test_register_requires_password(self, handler, mock_ws):
+        """Регистрация без пароля отклоняется (issue #15)."""
+        await handler.handle_register(mock_ws, {"nick": "nopass", "password": ""})
+
+        response = json.loads(mock_ws.send_str.call_args[0][0])
+        assert response["event"] == "ERROR"
+        assert "Password is required" in response["message"]
+
+    @pytest.mark.asyncio
+    async def test_msg_rate_limit(self, handler, mock_ws, database):
+        """После лимита сообщений следующее отклоняется (issue #17)."""
+        import time
+        from irc.commands import RATE_LIMIT_MSGS
+
+        await database.execute(
+            "INSERT INTO users (nick, password, created_at) VALUES (?, ?, ?)",
+            ("flooder", None, int(time.time()))
+        )
+        await database.commit()
+        handler.ws_manager.sessions[mock_ws] = {"nick": "flooder", "authenticated": True}
+        handler.ws_manager.connections.add(mock_ws)
+        handler.ws_manager.room_connections["#general"] = {mock_ws}
+
+        # Ровно лимит — проходят
+        for i in range(RATE_LIMIT_MSGS):
+            await handler.handle_msg(mock_ws, {
+                "room": "#general", "text": f"m{i}", "client_msg_id": f"c{i}"
+            })
+        # Следующее — отклонено
+        await handler.handle_msg(mock_ws, {
+            "room": "#general", "text": "over", "client_msg_id": "cX"
+        })
+
+        last = json.loads(mock_ws.send_str.call_args[0][0])
+        assert last["event"] == "ERROR"
+        assert "Rate limit" in last["message"]
+
+        # В БД — ровно лимит сообщений, «лишнее» не сохранено
+        row = await database.fetchone("SELECT COUNT(*) AS c FROM messages")
+        assert row["c"] == RATE_LIMIT_MSGS
+
+    @pytest.mark.asyncio
+    async def test_reconnect_requires_relogin(self, handler, mock_ws, database):
+        """
+        Новый сокет (как после reconnect) не аутентифицирован: MSG отклоняется,
+        а после повторного LOGIN — проходит. Это и есть поведение, на которое
+        опирается авто-релогин клиента (issue #6).
+        """
+        import time
+        import bcrypt
+
+        password_hash = bcrypt.hashpw(b"secret", bcrypt.gensalt()).decode()
+        await database.execute(
+            "INSERT INTO users (nick, password, created_at) VALUES (?, ?, ?)",
+            ("bob", password_hash, int(time.time()))
+        )
+        await database.commit()
+
+        # Новый сокет после переподключения — сессия чистая, не аутентифицирован
+        new_ws = MagicMock()
+        new_ws.send_str = AsyncMock()
+        await handler.ws_manager.add_connection(new_ws)
+
+        # MSG до логина — ошибка
+        await handler.handle_msg(new_ws, {"room": "#general", "text": "hi"})
+        resp = json.loads(new_ws.send_str.call_args[0][0])
+        assert resp["event"] == "ERROR"
+        assert "Authentication required" in resp["message"]
+
+        # Повторный LOGIN на новом сокете
+        await handler.handle_login(new_ws, {"nick": "bob", "password": "secret"})
+        assert handler.ws_manager.is_authenticated(new_ws) is True
+
+        # Теперь MSG проходит
+        handler.ws_manager.room_connections["#general"] = {new_ws}
+        await handler.handle_msg(new_ws, {
+            "room": "#general", "text": "back online", "client_msg_id": "r-1"
+        })
+        events = [json.loads(c[0][0]).get("event") for c in new_ws.send_str.call_args_list]
+        assert "MESSAGE" in events
+        assert "ACK" in events
+        # Ошибок аутентификации после релогина быть не должно
+        assert not any(
+            json.loads(c[0][0]).get("message") == "Authentication required"
+            for c in new_ws.send_str.call_args_list[-2:]
+        )

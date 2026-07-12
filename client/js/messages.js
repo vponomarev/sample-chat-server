@@ -8,6 +8,7 @@ class MessagesUI {
         this.currentRoom = '#general';
         this.messagesContainer = null;
         this.messageMap = new Map(); // client_msg_id -> message element
+        this.seenMsgIds = new Set(); // серверные msg_id, уже отрисованные (дедуп)
         this.initialized = false;
     }
 
@@ -111,9 +112,9 @@ class MessagesUI {
         return clientMsgId;
     }
 
-    updateMessageStatus(clientMsgId, status, serverMsgId) {
+    async updateMessageStatus(clientMsgId, status, serverMsgId) {
         console.log(`Обновление статуса сообщения ${clientMsgId}: ${status}`);
-        
+
         const msgElement = this.messageMap.get(clientMsgId);
         if (msgElement) {
             let statusEl = msgElement.querySelector('.message-status');
@@ -122,20 +123,39 @@ class MessagesUI {
                 statusEl.className = 'message-status';
                 msgElement.appendChild(statusEl);
             }
-            
+
             statusEl.textContent = this._getStatusText(status);
             statusEl.className = `message-status ${status}`;
-            
-            // Обновляем в хранилище
-            if (window.storage?.db && status === 'sent') {
-                window.storage.updateMessage(clientMsgId, { 
+        }
+
+        if (status !== 'sent' || !window.storage?.db) return;
+
+        // Проставляем реальный msg_id на элементе и помечаем его «увиденным»,
+        // чтобы последующая история/эхо с этим msg_id не создавали дубль.
+        if (serverMsgId) {
+            if (msgElement) msgElement.setAttribute('data-msg-id', serverMsgId);
+            this.seenMsgIds.add(serverMsgId);
+        }
+
+        // В хранилище: заменяем временную запись (ключ = client_msg_id) на
+        // каноническую (ключ = серверный msg_id). Иначе остаётся «осиротевшая»
+        // pending-запись, которая на перезагрузке рисуется как ещё одна копия.
+        try {
+            if (serverMsgId && serverMsgId !== clientMsgId) {
+                const rec = await window.storage.getMessage(clientMsgId);
+                await window.storage.deleteMessage(clientMsgId);
+                await window.storage.addMessage({
+                    ...(rec || {}),
+                    client_msg_id: clientMsgId,
+                    msg_id: serverMsgId,
                     status: 'sent',
-                    msg_id: serverMsgId 
-                }).catch(console.error);
-                
-                // Удаляем из pending очереди
-                window.storage.removeFromPendingQueue(clientMsgId).catch(console.error);
+                });
+            } else {
+                await window.storage.updateMessage(clientMsgId, { status: 'sent' });
             }
+            await window.storage.removeFromPendingQueue(clientMsgId);
+        } catch (e) {
+            console.error('Ошибка обновления сообщения в хранилище:', e);
         }
     }
 
@@ -164,7 +184,8 @@ class MessagesUI {
         
         this.messagesContainer.innerHTML = '';
         this.messageMap.clear();
-        
+        this.seenMsgIds.clear();
+
         // Загрузка из IndexedDB
         if (window.storage?.db) {
             window.storage.getMessagesByRoom(room).then(messages => {
@@ -180,7 +201,18 @@ class MessagesUI {
 
     _renderMessage(message) {
         if (!this.messagesContainer) return;
-        
+
+        // Дедупликация по серверному msg_id: одно и то же сообщение приходит
+        // несколько раз (эхо-broadcast, история при JOIN/переподключении,
+        // перезагрузка комнаты). Оптимистичная заглушка (msg_id == client_msg_id)
+        // не считается «увиденной» — она станет реальной после ACK.
+        const isOptimistic = message.client_msg_id
+            && message.msg_id === message.client_msg_id;
+        if (message.msg_id && !isOptimistic) {
+            if (this.seenMsgIds.has(message.msg_id)) return;
+            this.seenMsgIds.add(message.msg_id);
+        }
+
         const div = document.createElement('div');
         div.className = `message ${message.own ? 'own' : ''}`;
         
@@ -248,6 +280,7 @@ class MessagesUI {
             this.messagesContainer.innerHTML = '';
         }
         this.messageMap.clear();
+        this.seenMsgIds.clear();
     }
 }
 

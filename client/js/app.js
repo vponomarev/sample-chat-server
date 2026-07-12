@@ -8,6 +8,12 @@ class ChatApp {
         this.currentUser = null;
         this.isAuthenticated = false;
         this.pendingMessages = new Map(); // client_msg_id -> {text, room, timestamp}
+
+        // Учётные данные в памяти (только на время работы вкладки) — нужны для
+        // авто-релогина после обрыва соединения. В IndexedDB пароль не сохраняем.
+        this._credentials = null;
+        this._pendingCredentials = null;
+        this._reauthInProgress = false;
     }
 
     async init() {
@@ -53,6 +59,9 @@ class ChatApp {
 
         // Обработка изменения статуса подключения
         window.connection.onStatusChange((status) => this._updateConnectionStatus(status));
+
+        // Авто-релогин после (пере)подключения
+        window.connection.onReconnect(() => this._onReconnect());
 
         // Автоматическое подключение
         console.log('🔌 Установка подключения...');
@@ -270,35 +279,57 @@ class ChatApp {
 
     _handleLogin(nick, password) {
         this._clearAuthError();
-        
+
         // Проверка подключения
         if (!window.connection || !window.connection.ws || window.connection.ws.readyState !== WebSocket.OPEN) {
             console.error('❌ Нет подключения к серверу');
             this._showAuthError('Нет подключения к серверу. Проверьте настройки.');
             return;
         }
-        
+
+        // Запоминаем креды до подтверждения — на OK перенесём в _credentials
+        this._pendingCredentials = { nick, password };
         window.commands.login(nick, password);
         // Ответ обработается в _handleServerMessage
     }
 
     _handleRegister(nick, password) {
         this._clearAuthError();
-        
+
         // Проверка подключения
         if (!window.connection || !window.connection.ws || window.connection.ws.readyState !== WebSocket.OPEN) {
             console.error('❌ Нет подключения к серверу');
             this._showAuthError('Нет подключения к серверу. Проверьте настройки.');
             return;
         }
-        
+
+        this._pendingCredentials = { nick, password };
         window.commands.register(nick, password);
         // Ответ обработается в _handleServerMessage
+    }
+
+    /**
+     * Вызывается после (пере)подключения. Если была активная сессия —
+     * переавторизуемся; retry-очередь дошлём только после успешного LOGIN
+     * (см. _handleServerMessage). Иначе — сразу пробуем очередь.
+     */
+    _onReconnect() {
+        if (this._credentials?.nick) {
+            console.log('🔑 Переавторизация после переподключения:', this._credentials.nick);
+            this._reauthInProgress = true;
+            this._pendingCredentials = this._credentials;
+            window.commands.login(this._credentials.nick, this._credentials.password || '');
+        }
+        // Если сессии ещё нет — очередь не флашим: сначала нужен LOGIN,
+        // иначе сообщения уйдут в неаутентифицированный сокет. Очередь
+        // будет обработана после успешного входа (см. _handleServerMessage).
     }
 
     _handleLogout() {
         this.currentUser = null;
         this.isAuthenticated = false;
+        this._credentials = null;
+        this._pendingCredentials = null;
         window.storage.clearSession();
         window.connection.disconnect();
         this.showAuthScreen();
@@ -334,15 +365,39 @@ class ChatApp {
                     this.currentUser = data.nick;
                     this.isAuthenticated = true;
                     window.storage.setSession({ nick: data.nick });
-                    this.showChatScreen();
-                    
-                    // Запрос списка комнат
-                    window.commands.listRooms();
+
+                    // Запоминаем креды для авто-релогина (только в памяти)
+                    if (this._pendingCredentials?.nick === data.nick) {
+                        this._credentials = this._pendingCredentials;
+                    }
+                    this._pendingCredentials = null;
+
+                    if (this._reauthInProgress) {
+                        // Релогин после обрыва: экран не перерисовываем, а
+                        // восстанавливаем комнату (сервер потерял in-memory членство).
+                        this._reauthInProgress = false;
+                        const room = window.roomsUI?.currentRoom;
+                        if (room) {
+                            window.commands.join(room);
+                        }
+                    } else {
+                        this.showChatScreen();
+                        // Запрос списка комнат
+                        window.commands.listRooms();
+                    }
+
+                    // Аутентификация установлена — теперь безопасно дослать
+                    // отложенные сообщения из retry-очереди.
+                    window.connection.flushQueue();
                 }
                 break;
 
             case 'ERROR':
-                this._showAuthError(data.message);
+                // "Read-only replica" — переходный: сервер-реплика просит уйти
+                // на master; переключение сделает обработчик SERVER_LIST ниже.
+                if (data.message !== 'Read-only replica') {
+                    this._showAuthError(data.message);
+                }
                 break;
 
             case 'ROOM_LIST':
@@ -371,6 +426,8 @@ class ChatApp {
 
             case 'SERVER_LIST':
                 window.connection.setServers(data.servers);
+                // Если подключены не к master — переключиться на него
+                window.connection.ensureOnMaster();
                 break;
         }
     }

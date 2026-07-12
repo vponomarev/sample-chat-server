@@ -5,6 +5,11 @@ from prometheus_client import Counter, Gauge, Histogram, CollectorRegistry
 # Создаём отдельный реестр для наших метрик
 registry = CollectorRegistry()
 
+# Идентификатор сервера по умолчанию для метрик (задаётся в setup_metrics).
+# Позволяет всем helper-функциям автоматически проставлять правильный label,
+# не прокидывая server_id через все слои приложения.
+_DEFAULT_SERVER = "server1"
+
 # === Подключения ===
 irc_connected_clients = Gauge(
     "irc_connected_clients",
@@ -96,39 +101,41 @@ cluster_peers_alive = Gauge(
 )
 
 
-def setup_metrics():
-    """Инициализация метрик."""
-    pass
+def setup_metrics(server_id: str | None = None):
+    """Инициализация метрик. Запоминает server_id для проставления label."""
+    global _DEFAULT_SERVER
+    if server_id:
+        _DEFAULT_SERVER = server_id
 
 
-def update_connected_clients(count: int, server: str = "server1"):
+def update_connected_clients(count: int, server: str | None = None):
     """Обновление количества подключённых клиентов."""
-    irc_connected_clients.labels(server=server).set(count)
+    irc_connected_clients.labels(server=server or _DEFAULT_SERVER).set(count)
 
 
-def increment_websocket_connections(server: str = "server1"):
+def increment_websocket_connections(server: str | None = None):
     """Инкремент счётчика подключений."""
-    irc_websocket_connections_total.labels(server=server).inc()
+    irc_websocket_connections_total.labels(server=server or _DEFAULT_SERVER).inc()
 
 
-def increment_messages(room: str, server: str = "server1"):
+def increment_messages(room: str, server: str | None = None):
     """Инкремент счётчика сообщений."""
-    irc_messages_total.labels(server=server, room=room).inc()
+    irc_messages_total.labels(server=server or _DEFAULT_SERVER, room=room).inc()
 
 
-def update_room_members(room: str, count: int, server: str = "server1"):
+def update_room_members(room: str, count: int, server: str | None = None):
     """Обновление количества участников в комнате."""
-    irc_room_members.labels(server=server, room=room).set(count)
+    irc_room_members.labels(server=server or _DEFAULT_SERVER, room=room).set(count)
 
 
-def update_rooms_active(count: int, server: str = "server1"):
+def update_rooms_active(count: int, server: str | None = None):
     """Обновление количества активных комнат."""
-    irc_rooms_active.labels(server=server).set(count)
+    irc_rooms_active.labels(server=server or _DEFAULT_SERVER).set(count)
 
 
-def update_rooms_total(count: int, server: str = "server1"):
+def update_rooms_total(count: int, server: str | None = None):
     """Обновление общего количества комнат."""
-    irc_rooms_total.labels(server=server).set(count)
+    irc_rooms_total.labels(server=server or _DEFAULT_SERVER).set(count)
 
 
 def update_cluster_is_master(is_master: bool, server: str = "server1"):

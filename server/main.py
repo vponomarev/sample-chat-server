@@ -6,7 +6,7 @@ from aiohttp import web
 
 from config import get_config
 from storage.database import Database
-from network.ws_manager import WebSocketHandler
+from network.ws_manager import ConnectionRegistry
 from network.routes import setup_routes
 from observability.logger import setup_logging
 from observability.metrics import setup_metrics
@@ -22,7 +22,7 @@ async def on_startup(app: web.Application):
     app["db"] = db
 
     # WebSocket менеджер для рассылки сообщений
-    app["ws_manager"] = WebSocketHandler()
+    app["ws_manager"] = ConnectionRegistry()
 
     # Кластер (Фаза 3)
     if config.get("cluster_enabled") and config.get("peers"):
@@ -34,7 +34,8 @@ async def on_startup(app: web.Application):
             host=config["host"],
             port=config["port"],
             peers=config["peers"],
-            db_connection=db.connection
+            db_connection=db.connection,
+            secret=config.get("cluster_secret", "")
         )
         app["cluster"] = cluster
         await cluster.start()
@@ -60,8 +61,9 @@ async def on_shutdown(app: web.Application):
 
 def create_app() -> web.Application:
     """Создание и настройка приложения."""
-    setup_logging()
-    setup_metrics()
+    config = get_config()
+    setup_logging(config["log_level"], config["log_format"])
+    setup_metrics(config["server_id"])
 
     app = web.Application()
     app.on_startup.append(on_startup)

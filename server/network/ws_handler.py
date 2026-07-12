@@ -7,7 +7,11 @@ import time
 from aiohttp import web
 
 from irc.commands import CommandHandler
-from network.ws_manager import WebSocketHandler
+from network.ws_manager import ConnectionRegistry
+from observability.metrics import (
+    increment_websocket_connections,
+    update_connected_clients,
+)
 
 
 async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
@@ -15,12 +19,14 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
 
-    ws_manager: WebSocketHandler = request.app["ws_manager"]
+    ws_manager: ConnectionRegistry = request.app["ws_manager"]
     db = request.app["db"]
     cluster = request.app.get("cluster")
     command_handler = CommandHandler(db, ws_manager, cluster)
 
     await ws_manager.add_connection(ws)
+    increment_websocket_connections()
+    update_connected_clients(ws_manager.get_connected_count())
 
     try:
         async for msg in ws:
@@ -37,6 +43,7 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
                 logging.error(f"WebSocket error: {ws.exception()}")
     finally:
         ws_manager.remove_connection(ws)
+        update_connected_clients(ws_manager.get_connected_count())
 
     return ws
 

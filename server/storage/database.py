@@ -1,6 +1,7 @@
 """База данных SQLite."""
 
 import aiosqlite
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 
@@ -59,17 +60,33 @@ class Database:
         """)
 
         # Сообщения
+        # client_msg_id — идентификатор от клиента для идемпотентности (дедуп ретраев)
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS messages (
-                msg_id      TEXT PRIMARY KEY,
-                room        TEXT NOT NULL,
-                nick        TEXT NOT NULL,
-                text        TEXT NOT NULL,
-                ts          INTEGER NOT NULL,
+                msg_id        TEXT PRIMARY KEY,
+                room          TEXT NOT NULL,
+                nick          TEXT NOT NULL,
+                text          TEXT NOT NULL,
+                ts            INTEGER NOT NULL,
+                client_msg_id TEXT,
                 FOREIGN KEY (room) REFERENCES rooms(name),
                 FOREIGN KEY (nick) REFERENCES users(nick)
             )
         """)
+
+        # Миграция для БД, созданных до появления колонки client_msg_id
+        try:
+            await self._db.execute(
+                "ALTER TABLE messages ADD COLUMN client_msg_id TEXT"
+            )
+        except aiosqlite.OperationalError:
+            pass  # колонка уже существует
+
+        # Идемпотентность: один (автор, client_msg_id) = одно сообщение
+        await self._db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_msg_id "
+            "ON messages(nick, client_msg_id) WHERE client_msg_id IS NOT NULL"
+        )
 
         # WAL журнал (для репликации в Фазе 3)
         await self._db.execute("""
@@ -125,3 +142,22 @@ class Database:
     async def commit(self):
         """Коммит транзакции."""
         await self._db.commit()
+
+    @asynccontextmanager
+    async def transaction(self):
+        """
+        Транзакция: все запросы внутри блока применяются атомарно.
+
+        При успехе — commit, при любой ошибке — rollback (никакого
+        «полу-применённого» состояния). Пример использования:
+
+            async with db.transaction():
+                await db.execute("DELETE FROM room_members WHERE room = ?", (room,))
+                await db.execute("DELETE FROM rooms WHERE name = ?", (room,))
+        """
+        try:
+            yield self._db
+            await self._db.commit()
+        except Exception:
+            await self._db.rollback()
+            raise

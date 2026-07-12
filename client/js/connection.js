@@ -14,6 +14,7 @@ class Connection {
         this.maxReconnectAttempts = Infinity;
         this.onMessageCallback = null;
         this.onStatusChangeCallback = null;
+        this.onReconnectCallback = null;
         this.isConnected = false;
         this.isConnecting = false;
         
@@ -28,10 +29,29 @@ class Connection {
     setServers(servers) {
         this.servers = servers;
         console.log('Список серверов:', servers);
-        
+
         // Сохраняем в IndexedDB
         if (window.storage?.db) {
             window.storage.setServers(servers).catch(console.error);
+        }
+    }
+
+    /**
+     * Если известен master и мы подключены не к нему — переключиться.
+     * Закрываем сокет; штатный reconnect выберет master (см. connect()).
+     */
+    ensureOnMaster() {
+        const master = this.servers.find(s => s.role === 'master');
+        if (!master || !this.isConnected || !this.ws) return;
+
+        const current = this.servers[this.currentServerIndex];
+        const onMaster = current
+            && current.host === master.host
+            && current.port === master.port;
+
+        if (!onMaster) {
+            console.log('↪️ Переключение на master:', master);
+            this.ws.close();  // onclose → reconnect → connect() выберет master
         }
     }
 
@@ -61,6 +81,16 @@ class Connection {
             console.log('Stand-alone режим: сервер по умолчанию', this.servers[0]);
         }
 
+        // Модель primary + standby: писать может только master, поэтому
+        // подключаемся к нему. Если master в списке не помечен (идут выборы) —
+        // используем текущий индекс/ротацию и повторяем с backoff.
+        const masterIndex = this.servers.findIndex(s => s.role === 'master');
+        if (masterIndex >= 0) {
+            this.currentServerIndex = masterIndex;
+        } else if (this.currentServerIndex >= this.servers.length) {
+            this.currentServerIndex = 0;
+        }
+
         const server = this.servers[this.currentServerIndex];
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsUrl = `${protocol}//${server.host}:${server.port}/ws`;
@@ -79,9 +109,16 @@ class Connection {
                 this.backoffMs = this.initialBackoff;
                 this.reconnectAttempts = 0;
                 this._updateStatus('connected');
-                
-                // Обработка очереди после подключения
-                this._processRetryQueue();
+
+                // Сначала даём приложению переавторизоваться (после обрыва
+                // серверная сессия сброшена), и только потом флашим очередь —
+                // иначе сообщения уйдут в неаутентифицированный сокет и получат
+                // "Authentication required". Если обработчик не задан — флашим сразу.
+                if (this.onReconnectCallback) {
+                    this.onReconnectCallback();
+                } else {
+                    this._processRetryQueue();
+                }
             };
 
             this.ws.onmessage = (event) => {
@@ -162,6 +199,19 @@ class Connection {
 
     onStatusChange(callback) {
         this.onStatusChangeCallback = callback;
+    }
+
+    /**
+     * Колбэк, вызываемый после (пере)подключения — до флаша очереди.
+     * Приложение использует его для авто-релогина по сохранённой сессии.
+     */
+    onReconnect(callback) {
+        this.onReconnectCallback = callback;
+    }
+
+    /** Публичный запуск обработки retry-очереди (вызывается после релогина). */
+    flushQueue() {
+        this._processRetryQueue();
     }
 
     _handleDisconnect() {

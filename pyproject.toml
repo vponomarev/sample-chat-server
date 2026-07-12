@@ -5,6 +5,9 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"
+markers = [
+    "integration: сквозные тесты, поднимающие реальные процессы (медленные; -m 'not integration' чтобы пропустить)",
+]
 
 [tool.coverage.run]
 source = ["server"]

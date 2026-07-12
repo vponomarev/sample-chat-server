@@ -276,18 +276,19 @@ class TestWALReplication:
     @pytest.mark.asyncio
     async def test_apply_wal_entry_insert(self, wal_replication, database):
         """Тест применения INSERT операции."""
+        # seq = last_applied + 1 (0 + 1) — применяется строго по порядку
         entry = {
-            "seq": 100,
+            "seq": 1,
             "ts": 1234567890,
             "operation": "INSERT",
             "table_name": "users",
             "data": {"nick": "replicated_user", "password": None, "created_at": 1234567890}
         }
-        
+
         result = await wal_replication.apply_wal_entry(entry)
-        
+
         assert result is True
-        
+
         # Проверяем что пользователь создан
         user = await database.fetchone(
             "SELECT nick FROM users WHERE nick = 'replicated_user'"
@@ -307,17 +308,17 @@ class TestWALReplication:
         await database.commit()
         
         entry = {
-            "seq": 101,
+            "seq": 1,
             "ts": 1234567890,
             "operation": "DELETE",
             "table_name": "users",
             "data": {"nick": "to_delete"}
         }
-        
+
         result = await wal_replication.apply_wal_entry(entry)
-        
+
         assert result is True
-        
+
         # Проверяем что пользователь удалён
         user = await database.fetchone(
             "SELECT nick FROM users WHERE nick = 'to_delete'"
@@ -346,6 +347,38 @@ class TestWALReplication:
         """Тест получения отставания."""
         lag = wal_replication.get_lag()
         assert lag == 0
+
+    def test_get_lag_nonzero(self, wal_replication):
+        """Lag = разница между seq мастера и применённым."""
+        wal_replication._last_master_seq = 10
+        wal_replication._last_applied_seq = 4
+        assert wal_replication.get_lag() == 6
+
+    @pytest.mark.asyncio
+    async def test_apply_wal_entry_gap_not_applied(self, wal_replication, database):
+        """
+        Разрыв в seq не должен применяться и не должен двигать указатель
+        (иначе пропущенная запись теряется). Без известного master догон
+        невозможен, поэтому запись остаётся неприменённой (#12).
+        """
+        entry = {
+            "seq": 5,  # ожидалось 1 — разрыв
+            "ts": 1234567890,
+            "operation": "INSERT",
+            "table_name": "users",
+            "data": {"nick": "gap_user", "password": None, "created_at": 1},
+        }
+
+        result = await wal_replication.apply_wal_entry(entry)
+
+        assert result is False
+        assert wal_replication._last_applied_seq == 0
+        # last_master_seq всё равно обновился (для метрики lag)
+        assert wal_replication._last_master_seq == 5
+        user = await database.fetchone(
+            "SELECT nick FROM users WHERE nick = 'gap_user'"
+        )
+        assert user is None
 
     def test_set_master(self, wal_replication):
         """Тест установки режима master/slave."""
@@ -431,6 +464,156 @@ class TestPeerHandler:
         request.app = app
         
         response = await handle_cluster_state(request)
-        
+
         # Должен вернуть ошибку
         assert response.status == 503
+
+
+class TestTopologyConfig:
+    """Тесты разбора топологии кластера (config.parse_peers)."""
+
+    def test_parse_peers_explicit_ids(self):
+        from config import parse_peers
+        peers = parse_peers("server2@localhost:8082,server3@host3:8083")
+        assert peers == [
+            {"server_id": "server2", "host": "localhost", "port": 8082},
+            {"server_id": "server3", "host": "host3", "port": 8083},
+        ]
+
+    def test_parse_peers_empty(self):
+        from config import parse_peers
+        assert parse_peers("") == []
+
+    def test_parse_peers_legacy_without_id(self):
+        """Старый формат без ID всё ещё разбирается (с предупреждением)."""
+        from config import parse_peers
+        peers = parse_peers("localhost:8082")
+        assert peers[0]["host"] == "localhost"
+        assert peers[0]["port"] == 8082
+        assert peers[0]["server_id"]  # какой-то ID проставлен
+
+
+class TestWriteGuard:
+    """Модель primary + standby: запись разрешена только на master."""
+
+    @pytest.fixture
+    def mock_ws(self):
+        ws = MagicMock()
+        ws.send_str = AsyncMock()
+        return ws
+
+    class _SlaveCluster:
+        """Мок кластера-реплики."""
+        is_master = False
+        replication = None
+
+        def get_master_server(self):
+            return {"host": "localhost", "port": 8081, "server_id": "server3"}
+
+        def get_cluster_servers(self):
+            return [
+                {"host": "localhost", "port": 8081, "server_id": "server3", "role": "master"},
+                {"host": "localhost", "port": 8082, "server_id": "server2", "role": "slave"},
+            ]
+
+    @pytest.mark.asyncio
+    async def test_msg_rejected_on_replica(self, database, ws_manager, mock_ws):
+        """MSG на реплике отклоняется с Read-only replica и SERVER_LIST."""
+        from irc.commands import CommandHandler
+        import json
+
+        handler = CommandHandler(database, ws_manager, cluster=self._SlaveCluster())
+        ws_manager.sessions[mock_ws] = {"nick": "u", "authenticated": True}
+        ws_manager.connections.add(mock_ws)
+
+        await handler.handle_msg(mock_ws, {"room": "#general", "text": "hi"})
+
+        events = [json.loads(c[0][0]) for c in mock_ws.send_str.call_args_list]
+        err = next(e for e in events if e["event"] == "ERROR")
+        assert err["message"] == "Read-only replica"
+        assert err["master"]["server_id"] == "server3"
+        assert any(e["event"] == "SERVER_LIST" for e in events)
+
+        # Запись не попала в БД
+        row = await database.fetchone("SELECT COUNT(*) AS c FROM messages")
+        assert row["c"] == 0
+
+    @pytest.mark.asyncio
+    async def test_msg_allowed_standalone(self, database, ws_manager, mock_ws):
+        """Без кластера (standalone) запись разрешена."""
+        from irc.commands import CommandHandler
+        import json
+
+        import time
+        await database.execute(
+            "INSERT INTO users (nick, password, created_at) VALUES (?, ?, ?)",
+            ("u", None, int(time.time()))
+        )
+        await database.commit()
+
+        handler = CommandHandler(database, ws_manager, cluster=None)
+        ws_manager.sessions[mock_ws] = {"nick": "u", "authenticated": True}
+        ws_manager.connections.add(mock_ws)
+        ws_manager.room_connections["#general"] = {mock_ws}
+
+        await handler.handle_msg(mock_ws, {"room": "#general", "text": "hi", "client_msg_id": "x"})
+
+        events = [json.loads(c[0][0]).get("event") for c in mock_ws.send_str.call_args_list]
+        assert "MESSAGE" in events and "ACK" in events
+
+
+class TestClusterAuth:
+    """Аутентификация межсерверного трафика общим секретом (issue #10)."""
+
+    @staticmethod
+    def _request(path: str, token=None):
+        req = MagicMock()
+        req.path = path
+        req.method = "POST"
+        req.headers = {} if token is None else {"X-Cluster-Token": token}
+        return req
+
+    @staticmethod
+    async def _ok_handler(request):
+        from aiohttp import web
+        return web.json_response({"ok": True})
+
+    @pytest.mark.asyncio
+    async def test_protected_endpoint_rejects_missing_token(self):
+        from cluster.auth import make_cluster_auth_middleware
+        mw = make_cluster_auth_middleware("s3cret")
+        resp = await mw(self._request("/cluster/election/coordinator"), self._ok_handler)
+        assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_protected_endpoint_rejects_wrong_token(self):
+        from cluster.auth import make_cluster_auth_middleware
+        mw = make_cluster_auth_middleware("s3cret")
+        resp = await mw(
+            self._request("/cluster/replication/wal", token="nope"), self._ok_handler
+        )
+        assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_protected_endpoint_accepts_correct_token(self):
+        from cluster.auth import make_cluster_auth_middleware
+        mw = make_cluster_auth_middleware("s3cret")
+        resp = await mw(
+            self._request("/cluster/election/coordinator", token="s3cret"),
+            self._ok_handler,
+        )
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_observability_endpoints_are_open(self):
+        """/cluster/health и /cluster/state не требуют токена (мониторинг)."""
+        from cluster.auth import make_cluster_auth_middleware
+        mw = make_cluster_auth_middleware("s3cret")
+        for path in ("/cluster/health", "/cluster/state"):
+            resp = await mw(self._request(path), self._ok_handler)
+            assert resp.status == 200, path
+
+    def test_auth_headers(self):
+        from cluster.auth import auth_headers, CLUSTER_TOKEN_HEADER
+        assert auth_headers("s3cret") == {CLUSTER_TOKEN_HEADER: "s3cret"}
+        assert auth_headers("") == {}

@@ -11,7 +11,7 @@ from aiohttp.test_utils import TestServer, TestClient
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from network.ws_manager import WebSocketHandler
+from network.ws_manager import ConnectionRegistry
 
 
 @pytest.fixture
@@ -28,7 +28,7 @@ async def ws_client():
     await server.close()
 
 
-class TestWebSocketHandler:
+class TestConnectionRegistry:
     """Тесты WebSocket обработчиков."""
 
     @pytest.mark.asyncio
@@ -97,7 +97,7 @@ class TestWebSocketManager:
 
     @pytest.fixture
     def ws_manager(self):
-        return WebSocketHandler()
+        return ConnectionRegistry()
 
     @pytest.fixture
     def mock_ws(self):

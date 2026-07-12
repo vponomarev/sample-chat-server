@@ -5,7 +5,7 @@ from typing import Set, Dict
 from aiohttp import web
 
 
-class WebSocketHandler:
+class ConnectionRegistry:
     """Управление WebSocket подключениями."""
 
     def __init__(self):

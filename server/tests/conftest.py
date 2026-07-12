@@ -15,7 +15,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer, TestClient
 
 from storage.database import Database
-from network.ws_manager import WebSocketHandler
+from network.ws_manager import ConnectionRegistry
 from irc.commands import CommandHandler
 
 
@@ -39,7 +39,7 @@ async def database(temp_db_path):
 @pytest.fixture
 def ws_manager():
     """Фикстура WebSocket менеджера."""
-    return WebSocketHandler()
+    return ConnectionRegistry()
 
 
 @pytest.fixture

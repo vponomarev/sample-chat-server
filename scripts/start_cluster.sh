@@ -24,8 +24,10 @@ echo "🧹 Очистка данных..."
 rm -rf data/*.db data/*.db-journal data/*.db-wal 2>/dev/null || true
 
 # Запуск серверов
+# Каждому узлу — своя БД (локально узлы не должны делить один файл SQLite)
 echo "🚀 Запуск сервера 1 (port 8081)..."
-SERVER_ID=server1 CHAT_PORT=8081 PEERS="localhost:8082,localhost:8083" CLUSTER_ENABLED=true \
+SERVER_ID=server1 CHAT_PORT=8081 CHAT_DB_PATH=data/chat-server1.db \
+    PEERS="server2@localhost:8082,server3@localhost:8083" CLUSTER_ENABLED=true \
     python server/main.py > /tmp/server1.log 2>&1 &
 PID1=$!
 echo "   Server 1 PID: $PID1"
@@ -33,7 +35,8 @@ echo "   Server 1 PID: $PID1"
 sleep 1
 
 echo "🚀 Запуск сервера 2 (port 8082)..."
-SERVER_ID=server2 CHAT_PORT=8082 PEERS="localhost:8081,localhost:8083" CLUSTER_ENABLED=true \
+SERVER_ID=server2 CHAT_PORT=8082 CHAT_DB_PATH=data/chat-server2.db \
+    PEERS="server1@localhost:8081,server3@localhost:8083" CLUSTER_ENABLED=true \
     python server/main.py > /tmp/server2.log 2>&1 &
 PID2=$!
 echo "   Server 2 PID: $PID2"
@@ -41,7 +44,8 @@ echo "   Server 2 PID: $PID2"
 sleep 1
 
 echo "🚀 Запуск сервера 3 (port 8083)..."
-SERVER_ID=server3 CHAT_PORT=8083 PEERS="localhost:8081,localhost:8082" CLUSTER_ENABLED=true \
+SERVER_ID=server3 CHAT_PORT=8083 CHAT_DB_PATH=data/chat-server3.db \
+    PEERS="server1@localhost:8081,server2@localhost:8082" CLUSTER_ENABLED=true \
     python server/main.py > /tmp/server3.log 2>&1 &
 PID3=$!
 echo "   Server 3 PID: $PID3"

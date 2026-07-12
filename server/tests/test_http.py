@@ -100,31 +100,38 @@ class TestStaticFiles:
 
     @pytest.mark.asyncio
     async def test_css_file(self, http_client):
-        """Тест CSS файла."""
-        resp = await http_client.get("/static/css/style.css")
-        
+        """CSS отдаётся по пути, который реально запрашивает index.html."""
+        resp = await http_client.get("/css/style.css")
+
         assert resp.status == 200
         text = await resp.text()
         assert "body" in text or ":root" in text
 
     @pytest.mark.asyncio
     async def test_js_file(self, http_client):
-        """Тест JS файла."""
-        resp = await http_client.get("/static/js/app.js")
-        
+        """JS отдаётся по пути, который реально запрашивает index.html."""
+        resp = await http_client.get("/js/app.js")
+
         assert resp.status == 200
         text = await resp.text()
         assert "class" in text or "function" in text
 
     @pytest.mark.asyncio
     async def test_manifest(self, http_client):
-        """Тест PWA manifest."""
-        resp = await http_client.get("/static/manifest.json")
-        
+        """PWA manifest отдаётся из корня (как в <link rel=manifest>)."""
+        resp = await http_client.get("/manifest.json")
+
         assert resp.status == 200
         data = await resp.json()
-        
+
         assert "name" in data or "short_name" in data
+
+    @pytest.mark.asyncio
+    async def test_service_worker_served_from_root(self, http_client):
+        """sw.js должен отдаваться из корня — иначе scope='/' не сработает."""
+        resp = await http_client.get("/sw.js")
+
+        assert resp.status == 200
 
 
 class Test404:
