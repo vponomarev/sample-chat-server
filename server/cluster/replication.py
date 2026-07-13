@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 import aiohttp
 from aiosqlite import Connection
 
+from cluster.circuit_breaker import CircuitBreaker
+
 
 @dataclass
 class WALEntry:
@@ -81,7 +83,20 @@ class WALReplication:
         # Локатор master (инъектируется из ClusterManager) для запроса догона
         self._master_locator: Optional[Callable] = None
 
+        # По одному circuit breaker на пира: не долбим недоступную реплику
+        # каждым сообщением (issue B11, Этап 3.2). Пропущенное реплика догонит
+        # через /cluster/replication/sync при следующей записи или разрыве seq.
+        self._breakers: Dict[str, CircuitBreaker] = {}
+
         logging.info(f"[WAL] Инициализирован для {server_id} (master={is_master})")
+
+    def _breaker(self, peer_id: str) -> CircuitBreaker:
+        """Возвращает (создавая при необходимости) breaker для пира."""
+        br = self._breakers.get(peer_id)
+        if br is None:
+            br = CircuitBreaker(name=f"wal->{peer_id}")
+            self._breakers[peer_id] = br
+        return br
 
     def set_master_locator(self, locator: Callable):
         """Задаёт функцию, возвращающую dict master-сервера {host, port} (или None)."""
@@ -195,7 +210,15 @@ class WALReplication:
             await asyncio.gather(*tasks, return_exceptions=True)
     
     async def _send_wal_to_peer(self, peer: Dict, entry: Dict):
-        """Отправка WAL записи пиру."""
+        """Отправка WAL записи пиру через circuit breaker."""
+        peer_id = peer.get("server_id", f"{peer['host']}:{peer['port']}")
+        breaker = self._breaker(peer_id)
+
+        # Цепь разомкнута — не тратим таймаут на заведомо мёртвого пира.
+        if not breaker.allow():
+            logging.debug(f"[WAL] Пропуск отправки {peer_id}: circuit {breaker.state}")
+            return None
+
         try:
             url = f"http://{peer['host']}:{peer['port']}/cluster/replication/wal"
             async with self._session.post(
@@ -204,10 +227,12 @@ class WALReplication:
                 raise_for_status=True
             ) as response:
                 result = await response.json()
-                logging.debug(f"[WAL] Отправлено {peer.get('server_id')}: seq={entry['entries'][0]['seq']}")
+                logging.debug(f"[WAL] Отправлено {peer_id}: seq={entry['entries'][0]['seq']}")
+                breaker.record_success()
                 return result
         except Exception as e:
-            logging.error(f"[WAL] Ошибка отправки {peer.get('server_id')}: {e}")
+            breaker.record_failure()
+            logging.error(f"[WAL] Ошибка отправки {peer_id}: {e}")
             return None
     
     async def get_wal_entries(self, after_seq: int) -> List[WALEntry]:

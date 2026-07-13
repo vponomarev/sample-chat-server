@@ -384,9 +384,32 @@ class TestWALReplication:
         """Тест установки режима master/slave."""
         wal_replication.set_master(False)
         assert wal_replication.is_master is False
-        
+
         wal_replication.set_master(True)
         assert wal_replication.is_master is True
+
+    @pytest.mark.asyncio
+    async def test_send_wal_circuit_breaker_short_circuits(self, wal_replication):
+        """
+        После серии ошибок к мёртвому пиру circuit breaker размыкается и
+        следующие отправки не делают сетевой вызов (issue B11, Этап 3.2).
+        """
+        sess = MagicMock()
+        sess.post.side_effect = ConnectionError("peer down")
+        wal_replication._session = sess
+
+        peer = {"host": "localhost", "port": 9999, "server_id": "peerX"}
+        entry = {"entries": [{"seq": 1}]}
+
+        for _ in range(3):  # порог по умолчанию — 3
+            await wal_replication._send_wal_to_peer(peer, entry)
+
+        assert wal_replication._breaker("peerX").state == "open"
+
+        calls_before = sess.post.call_count
+        result = await wal_replication._send_wal_to_peer(peer, entry)
+        assert result is None
+        assert sess.post.call_count == calls_before  # вызова не было — коротко замкнули
 
 
 class TestClusterManager:
