@@ -411,6 +411,51 @@ class TestWALReplication:
         assert result is None
         assert sess.post.call_count == calls_before  # вызова не было — коротко замкнули
 
+    @pytest.mark.asyncio
+    async def test_replication_ack_and_retry(self, wal_replication, database):
+        """
+        ACK двигает отметку подтверждения; потерянный пуш догоняется повторной
+        доставкой бэклога (issue B3, Этап 3.3).
+        """
+        class _AckResp:
+            def __init__(self, data):
+                self._data = data
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def json(self):
+                return self._data
+
+        # Наполняем WAL двумя операциями (пиров нет — отправок не происходит).
+        await wal_replication.log_operation(
+            "INSERT", "users", {"nick": "a", "password": None, "created_at": 1})
+        await wal_replication.log_operation(
+            "INSERT", "users", {"nick": "b", "password": None, "created_at": 1})
+
+        peer = {"host": "localhost", "port": 9999, "server_id": "peerX"}
+        wal_replication.peers = [peer]
+
+        # 1) Первый пуш теряется — пир недоступен, отметка не двигается.
+        sess = MagicMock()
+        sess.post.side_effect = ConnectionError("down")
+        wal_replication._session = sess
+        await wal_replication._send_pending_to_peer(peer)
+        assert wal_replication._peer_acked.get("peerX", 0) == 0
+
+        # 2) Пир вернулся и подтвердил seq=2 — ретрай доставляет весь бэклог.
+        sess.post.side_effect = None
+        sess.post.return_value = _AckResp({"ack": True, "last_applied_seq": 2})
+        await wal_replication._send_pending_to_peer(peer)
+
+        assert wal_replication._peer_acked["peerX"] == 2
+        # В доставленном пейлоаде — обе накопленные записи (бэклог целиком).
+        sent = sess.post.call_args.kwargs["json"]
+        assert [e["seq"] for e in sent["entries"]] == [1, 2]
+
 
 class TestClusterManager:
     """Тесты ClusterManager."""

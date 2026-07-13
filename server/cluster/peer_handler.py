@@ -92,10 +92,13 @@ async def handle_wal_replication(request: web.Request) -> web.Response:
         success = await cluster.replication.apply_wal_entry(entry)
         if success:
             acked.append(entry.get("seq"))
-    
+
+    # last_applied_seq — точка подтверждения для ACK-репликации (Этап 3.3):
+    # master по ней понимает, до какого seq реплика дошла, и что дослать.
     return web.json_response({
         "ack": True,
-        "acked_seqs": acked
+        "acked_seqs": acked,
+        "last_applied_seq": cluster.replication.last_applied_seq,
     })
 
 

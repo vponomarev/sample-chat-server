@@ -15,6 +15,9 @@ from aiosqlite import Connection
 
 from cluster.circuit_breaker import CircuitBreaker
 
+# Период фоновой повторной доставки WAL отстающим пирам (Этап 3.3).
+RETRY_INTERVAL_SEC = 2.0
+
 
 @dataclass
 class WALEntry:
@@ -84,9 +87,17 @@ class WALReplication:
         self._master_locator: Optional[Callable] = None
 
         # По одному circuit breaker на пира: не долбим недоступную реплику
-        # каждым сообщением (issue B11, Этап 3.2). Пропущенное реплика догонит
-        # через /cluster/replication/sync при следующей записи или разрыве seq.
+        # каждым сообщением (issue B11, Этап 3.2).
         self._breakers: Dict[str, CircuitBreaker] = {}
+
+        # ACK-репликация (issue B3, Этап 3.3): master помнит, до какого seq
+        # каждый пир подтвердил применение. Отправляем пиру всё после его
+        # подтверждённого seq (бэклог + новое), а фоновый retry-loop повторяет
+        # доставку отставшим — так пропущенная запись догоняется даже без новых
+        # записей (это закрывает «single-write gap»). Пуш идемпотентен: уже
+        # применённые записи реплика молча пропускает.
+        self._peer_acked: Dict[str, int] = {}
+        self._retry_task: Optional[asyncio.Task] = None
 
         logging.info(f"[WAL] Инициализирован для {server_id} (master={is_master})")
 
@@ -110,9 +121,12 @@ class WALReplication:
             headers=auth_headers(self.secret),
         )
         self._running = True
-        
+
         # Получаем последний применённый seq
         await self._load_last_seq()
+
+        # Фоновая повторная доставка отстающим пирам (работает только на master)
+        self._retry_task = asyncio.create_task(self._retry_loop())
 
         logging.info(f"[WAL] Запущен (last_seq={self._last_applied_seq})")
 
@@ -120,10 +134,34 @@ class WALReplication:
         """Остановка репликации."""
         self._running = False
 
+        if self._retry_task:
+            self._retry_task.cancel()
+            try:
+                await self._retry_task
+            except asyncio.CancelledError:
+                pass
+
         if self._session:
             await self._session.close()
 
         logging.info("[WAL] Остановлен")
+
+    @property
+    def last_applied_seq(self) -> int:
+        """Последний применённый seq (используется в ACK)."""
+        return self._last_applied_seq
+
+    async def _retry_loop(self):
+        """Периодически дослывает WAL отставшим пирам (только на master)."""
+        while self._running:
+            try:
+                await asyncio.sleep(RETRY_INTERVAL_SEC)
+                if self.is_master:
+                    await self._replicate_pending()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.error(f"[WAL] Ошибка retry-loop: {e}")
     
     async def _load_last_seq(self):
         """Загрузка последнего применённого seq."""
@@ -175,43 +213,52 @@ class WALReplication:
         seq = cursor.lastrowid
         
         logging.debug(f"[WAL] Записана операция: seq={seq}, op={operation}, table={table_name}")
-        
-        # Отправка slave
-        await self._broadcast_wal_entry(seq, ts, operation, table_name, data)
-        
+
+        # Отправка slave: шлём каждому пиру всё после его подтверждённого seq
+        await self._replicate_pending()
+
         return seq
-    
-    async def _broadcast_wal_entry(
-        self,
-        seq: int,
-        ts: int,
-        operation: str,
-        table_name: str,
-        data: Dict[str, Any]
-    ):
-        """Рассылка WAL записи всем slave."""
-        entry = {
-            "type": "WAL_APPEND",
-            "entries": [{
-                "seq": seq,
-                "ts": ts,
-                "operation": operation,
-                "table_name": table_name,
-                "data": data
-            }]
-        }
-        
+
+    def _peer_id(self, peer: Dict) -> str:
+        return peer.get("server_id", f"{peer['host']}:{peer['port']}")
+
+    async def _replicate_pending(self):
+        """Досылает каждому пиру WAL-записи после его подтверждённого seq."""
         tasks = []
         for peer in self.peers:
-            if peer.get("server_id") != self.server_id:
-                tasks.append(self._send_wal_to_peer(peer, entry))
-        
+            if self._peer_id(peer) != self.server_id:
+                tasks.append(self._send_pending_to_peer(peer))
+
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-    
+
+    async def _send_pending_to_peer(self, peer: Dict):
+        """
+        Шлёт пиру все записи после подтверждённого им seq и по ACK обновляет
+        отметку подтверждения. Пусто — ничего не делаем.
+        """
+        peer_id = self._peer_id(peer)
+        acked = self._peer_acked.get(peer_id, 0)
+
+        entries = await self.get_wal_entries(acked)
+        if not entries:
+            return
+
+        payload = {
+            "type": "WAL_APPEND",
+            "entries": [e.to_dict() for e in entries],
+        }
+        result = await self._send_wal_to_peer(peer, payload)
+        if result is not None:
+            # ACK: пир сообщает свой last_applied_seq — сдвигаем отметку
+            peer_seq = int(result.get("last_applied_seq", acked))
+            if peer_seq > acked:
+                self._peer_acked[peer_id] = peer_seq
+                logging.debug(f"[WAL] {peer_id} подтвердил seq={peer_seq}")
+
     async def _send_wal_to_peer(self, peer: Dict, entry: Dict):
-        """Отправка WAL записи пиру через circuit breaker."""
-        peer_id = peer.get("server_id", f"{peer['host']}:{peer['port']}")
+        """Низкоуровневая отправка WAL-пейлоада пиру через circuit breaker."""
+        peer_id = self._peer_id(peer)
         breaker = self._breaker(peer_id)
 
         # Цепь разомкнута — не тратим таймаут на заведомо мёртвого пира.
