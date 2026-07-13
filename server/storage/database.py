@@ -107,6 +107,18 @@ class Database:
             )
         """)
 
+        # Снапшот состояния (Этап 3.5): одна строка (id=1) с JSON-дампом таблиц
+        # данных на момент seq. Нужен для компакции WAL и восстановления узлов,
+        # отставших дальше, чем хранится журнал.
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS snapshots (
+                id          INTEGER PRIMARY KEY CHECK (id = 1),
+                seq         INTEGER NOT NULL,
+                data        TEXT NOT NULL,
+                created_at  INTEGER NOT NULL
+            )
+        """)
+
         # Создаём комнату #general по умолчанию
         await self._db.execute("""
             INSERT OR IGNORE INTO rooms (name, owner, created_at)

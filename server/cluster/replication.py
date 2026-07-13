@@ -14,9 +14,15 @@ import aiohttp
 from aiosqlite import Connection
 
 from cluster.circuit_breaker import CircuitBreaker
+from cluster.snapshot import SnapshotManager
 
 # Период фоновой повторной доставки WAL отстающим пирам (Этап 3.3).
 RETRY_INTERVAL_SEC = 2.0
+
+# Порог размера WAL (записей), при превышении которого master делает снапшот и
+# обрезает журнал (Этап 3.5). Небольшое значение — чтобы поведение было видно в
+# демо; в проде порог был бы куда больше.
+SNAPSHOT_WAL_THRESHOLD = 1000
 
 
 @dataclass
@@ -99,6 +105,9 @@ class WALReplication:
         self._peer_acked: Dict[str, int] = {}
         self._retry_task: Optional[asyncio.Task] = None
 
+        # Снапшоты + компакция WAL (Этап 3.5)
+        self._snapshots = SnapshotManager(db_connection)
+
         logging.info(f"[WAL] Инициализирован для {server_id} (master={is_master})")
 
     def _breaker(self, peer_id: str) -> CircuitBreaker:
@@ -152,16 +161,73 @@ class WALReplication:
         return self._last_applied_seq
 
     async def _retry_loop(self):
-        """Периодически дослывает WAL отставшим пирам (только на master)."""
+        """Дослывает WAL отставшим пирам и компактит журнал (только master)."""
         while self._running:
             try:
                 await asyncio.sleep(RETRY_INTERVAL_SEC)
                 if self.is_master:
                     await self._replicate_pending()
+                    await self._maybe_compact()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logging.error(f"[WAL] Ошибка retry-loop: {e}")
+
+    async def _maybe_compact(self):
+        """Если WAL перерос порог — делаем снапшот и обрезаем журнал."""
+        async with self.db.execute("SELECT COUNT(*) FROM wal") as cursor:
+            row = await cursor.fetchone()
+        if row and row[0] > SNAPSHOT_WAL_THRESHOLD:
+            await self.snapshot_and_compact()
+
+    async def snapshot_and_compact(self) -> Optional[int]:
+        """
+        Master: снимает снапшот на текущий максимальный seq и обрезает WAL до
+        него включительно. Возвращает seq снапшота (или None, если WAL пуст).
+
+        Безопасность: отставший пир, чей acked оказался ниже обрезанного WAL,
+        восстановится из снапшота (см. _recover_from_snapshot) и догонит хвост.
+        """
+        async with self.db.execute("SELECT MAX(seq) FROM wal") as cursor:
+            row = await cursor.fetchone()
+        max_seq = row[0] if row else None
+        if not max_seq:
+            return None
+
+        await self._snapshots.create(max_seq)
+        await self.db.execute("DELETE FROM wal WHERE seq <= ?", (max_seq,))
+        await self.db.commit()
+        logging.info(f"[WAL] Компакция: WAL обрезан до seq={max_seq}")
+        return max_seq
+
+    async def _recover_from_snapshot(self, master_url: str) -> bool:
+        """
+        Тянет снапшот у master и восстанавливает из него состояние, сдвигая
+        last_applied_seq к seq снапшота. Хвост WAL догоняется отдельно.
+        """
+        try:
+            url = f"{master_url}/cluster/replication/snapshot"
+            async with self._session.get(url, raise_for_status=True) as response:
+                snapshot = await response.json()
+        except Exception as e:
+            logging.error(f"[WAL] Не удалось получить снапшот: {e}")
+            return False
+
+        if not snapshot or snapshot.get("seq") is None:
+            logging.warning("[WAL] У master нет снапшота для восстановления")
+            return False
+
+        await self._snapshots.restore(snapshot)
+        self._last_applied_seq = int(snapshot["seq"])
+        if self._last_applied_seq > self._last_master_seq:
+            self._last_master_seq = self._last_applied_seq
+        await self.db.execute(
+            "UPDATE cluster_meta SET value = ? WHERE key = 'last_applied_seq'",
+            (str(self._last_applied_seq),),
+        )
+        await self.db.commit()
+        logging.info(f"[WAL] Состояние восстановлено из снапшота до seq={self._last_applied_seq}")
+        return True
     
     async def _load_last_seq(self):
         """Загрузка последнего применённого seq."""
@@ -447,23 +513,49 @@ class WALReplication:
         pass
     
     async def request_sync(self, master_url: str) -> bool:
-        """Запрос синхронизации с master (при подключении slave)."""
+        """
+        Догон WAL у master. Если журнал мастера уже обрезан ниже нужного нам
+        места (min_seq > last_applied+1), сперва восстанавливаемся из снапшота,
+        затем повторно тянем хвост журнала.
+        """
         try:
             url = f"{master_url}/cluster/replication/sync?after_seq={self._last_applied_seq}"
             async with self._session.get(url, raise_for_status=True) as response:
                 data = await response.json()
-                entries = data.get("entries", [])
-                
-                logging.info(f"[WAL] Синхронизация: получено {len(entries)} записей")
-                
-                for entry in entries:
-                    await self.apply_wal_entry(entry)
-                
-                return True
+
+            min_seq = data.get("min_seq")  # самый ранний seq, ещё хранящийся в WAL мастера
+
+            # WAL не покрывает нашу позицию — нужен снапшот.
+            if min_seq is not None and min_seq > self._last_applied_seq + 1:
+                logging.warning(
+                    f"[WAL] WAL мастера обрезан (min_seq={min_seq} > "
+                    f"{self._last_applied_seq + 1}) — восстановление из снапшота"
+                )
+                if await self._recover_from_snapshot(master_url):
+                    # После снапшота один раз добираем хвост WAL.
+                    return await self.request_sync(master_url)
+                return False
+
+            entries = data.get("entries", [])
+            logging.info(f"[WAL] Синхронизация: получено {len(entries)} записей")
+            for entry in entries:
+                await self.apply_wal_entry(entry)
+
+            return True
         except Exception as e:
             logging.error(f"[WAL] Ошибка синхронизации: {e}")
             return False
     
+    async def get_min_wal_seq(self) -> Optional[int]:
+        """Самый ранний seq, ещё хранящийся в WAL (None, если журнал пуст)."""
+        async with self.db.execute("SELECT MIN(seq) FROM wal") as cursor:
+            row = await cursor.fetchone()
+        return row[0] if row and row[0] is not None else None
+
+    async def load_snapshot(self) -> Optional[Dict]:
+        """Последний снапшот для отдачи отстающему узлу (или None)."""
+        return await self._snapshots.load_latest()
+
     def get_lag(self) -> int:
         """Отставание репликации: сколько записей master ещё не применено."""
         return max(0, self._last_master_seq - self._last_applied_seq)

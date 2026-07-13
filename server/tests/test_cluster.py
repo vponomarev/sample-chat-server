@@ -742,3 +742,119 @@ class TestReadiness:
         info = m.get_readiness()
         assert info["ready"] is True
         assert info["role"] == "slave"
+
+
+class _JsonCM:
+    """Мок aiohttp-ответа как async context manager с .json()."""
+
+    def __init__(self, data):
+        self._data = data
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def json(self):
+        return self._data
+
+
+class TestSnapshotAndCompaction:
+    """Снапшоты, компакция WAL и восстановление узла — issue B16/B17, Этап 3.5."""
+
+    @pytest.mark.asyncio
+    async def test_snapshot_create_load_restore(self, database):
+        """Снапшот снимается, читается и восстанавливает таблицы данных."""
+        from cluster.snapshot import SnapshotManager
+
+        await database.execute(
+            "INSERT INTO users (nick, password, created_at) VALUES ('u1', NULL, 1)")
+        await database.execute(
+            "INSERT INTO rooms (name, owner, created_at) VALUES ('#r', 'u1', 1)")
+        await database.execute(
+            "INSERT INTO messages (msg_id, room, nick, text, ts, client_msg_id) "
+            "VALUES ('m1', '#r', 'u1', 'hi', 1, 'c1')")
+        await database.commit()
+
+        sm = SnapshotManager(database.connection)
+        snap = await sm.create(5)
+        assert snap["seq"] == 5
+        assert ["u1", None, 1] in snap["tables"]["users"]
+
+        loaded = await sm.load_latest()
+        assert loaded["seq"] == 5
+
+        # Портим состояние и восстанавливаем из снапшота.
+        await database.execute("DELETE FROM messages")
+        await database.commit()
+        await sm.restore(loaded)
+        row = await database.fetchone("SELECT COUNT(*) AS c FROM messages")
+        assert row["c"] == 1
+
+    @pytest.mark.asyncio
+    async def test_snapshot_and_compact_truncates_wal(self, database):
+        """snapshot_and_compact делает снапшот и обрезает WAL."""
+        from cluster.replication import WALReplication
+
+        repl = WALReplication("server1", database.connection, is_master=True, peers=[])
+        await repl.log_operation(
+            "INSERT", "users", {"nick": "a", "password": None, "created_at": 1})
+        await repl.log_operation(
+            "INSERT", "users", {"nick": "b", "password": None, "created_at": 1})
+
+        seq = await repl.snapshot_and_compact()
+        assert seq == 2
+
+        row = await database.fetchone("SELECT COUNT(*) AS c FROM wal")
+        assert row["c"] == 0
+        snap = await repl.load_snapshot()
+        assert snap["seq"] == 2
+
+    @pytest.mark.asyncio
+    async def test_request_sync_recovers_from_snapshot(self, database):
+        """
+        Реплика, отставшая ниже обрезанного WAL, восстанавливается из снапшота
+        и затем догоняет хвост журнала (Этап 3.5).
+        """
+        from cluster.replication import WALReplication
+
+        repl = WALReplication("server2", database.connection, is_master=False)
+        repl._last_applied_seq = 0
+
+        snapshot = {
+            "seq": 5,
+            "tables": {
+                "users": [["u1", None, 1]],
+                "rooms": [["#r", "u1", 1]],
+                "room_members": [],
+                "messages": [["m5", "#r", "u1", "snap", 1, "c5"]],
+            },
+        }
+        tail_entry = {
+            "seq": 6, "ts": 1, "operation": "INSERT", "table_name": "messages",
+            "data": {"msg_id": "m6", "room": "#r", "nick": "u1",
+                     "text": "tail", "ts": 1, "client_msg_id": "c6"},
+        }
+
+        def _get(url, **kwargs):
+            if "after_seq=0" in url:
+                # WAL обрезан: самый ранний seq = 6, нашей позиции (1) там нет
+                return _JsonCM({"entries": [], "min_seq": 6})
+            if "snapshot" in url:
+                return _JsonCM(snapshot)
+            if "after_seq=5" in url:
+                return _JsonCM({"entries": [tail_entry], "min_seq": 6})
+            raise AssertionError(f"неожиданный URL: {url}")
+
+        sess = MagicMock()
+        sess.get.side_effect = _get
+        repl._session = sess
+
+        ok = await repl.request_sync("http://master")
+        assert ok is True
+
+        # Снапшот применён (m5) + догнан хвост (m6); позиция = 6.
+        assert repl._last_applied_seq == 6
+        assert (await database.fetchone(
+            "SELECT COUNT(*) AS c FROM messages WHERE msg_id IN ('m5','m6')"))["c"] == 2

@@ -24,6 +24,7 @@ def setup_cluster_routes(app: web.Application):
     # Replication endpoints
     app.router.add_post("/cluster/replication/wal", handle_wal_replication)
     app.router.add_get("/cluster/replication/sync", handle_wal_sync)
+    app.router.add_get("/cluster/replication/snapshot", handle_snapshot)
     
     # Cluster state
     app.router.add_get("/cluster/state", handle_cluster_state)
@@ -116,13 +117,34 @@ async def handle_wal_sync(request: web.Request) -> web.Response:
         )
     
     after_seq = int(request.query.get("after_seq", 0))
-    
+
     entries = await cluster.replication.get_wal_entries(after_seq)
-    
+    min_seq = await cluster.replication.get_min_wal_seq()
+
     return web.json_response({
         "entries": [e.to_dict() for e in entries],
-        "count": len(entries)
+        "count": len(entries),
+        # min_seq позволяет slave понять, что WAL обрезан ниже его позиции и
+        # нужно восстановиться из снапшота (Этап 3.5).
+        "min_seq": min_seq,
     })
+
+
+async def handle_snapshot(request: web.Request) -> web.Response:
+    """Отдаёт последний снапшот состояния отстающему узлу (Этап 3.5)."""
+    cluster = request.app.get("cluster")
+
+    if not cluster or not cluster.replication:
+        return web.json_response({"error": "No replication"}, status=503)
+
+    if not cluster.replication.is_master:
+        return web.json_response({"error": "Not master"}, status=403)
+
+    snapshot = await cluster.replication.load_snapshot()
+    if not snapshot:
+        return web.json_response({"seq": None, "tables": {}})
+
+    return web.json_response(snapshot)
 
 
 async def handle_cluster_state(request: web.Request) -> web.Response:
