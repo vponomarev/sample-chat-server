@@ -858,3 +858,181 @@ class TestSnapshotAndCompaction:
         assert repl._last_applied_seq == 6
         assert (await database.fetchone(
             "SELECT COUNT(*) AS c FROM messages WHERE msg_id IN ('m5','m6')"))["c"] == 2
+
+
+class _Peer:
+    """Лёгкий объект пира для тестов кворума (нужны только поля ниже)."""
+
+    def __init__(self, server_id, is_alive=True, role="slave", ever_seen=True):
+        self.server_id = server_id
+        self.is_alive = is_alive
+        self.role = role
+        self.ever_seen = ever_seen
+
+
+class TestQuorum:
+    """Кворум для становления master — issue #11, Этап 4.1."""
+
+    def _manager(self, peers):
+        from cluster.manager import ClusterManager
+        from aiohttp import web
+        return ClusterManager(
+            app=web.Application(), server_id="server1",
+            host="localhost", port=8081, peers=peers, db_connection=None,
+        )
+
+    def test_standalone_always_has_quorum(self):
+        """Одиночный узел (без пиров) — кворум есть всегда."""
+        m = self._manager(peers=[])
+        m.heartbeat = MagicMock()
+        m.heartbeat.peers = {}
+        assert m._has_quorum() is True
+
+    def test_three_nodes_majority_alive_has_quorum(self):
+        """3 узла, живы 2 (я + один пир) — кворум есть."""
+        m = self._manager(peers=[
+            {"host": "h", "port": 2, "server_id": "server2"},
+            {"host": "h", "port": 3, "server_id": "server3"},
+        ])
+        m.heartbeat = MagicMock()
+        m.heartbeat.peers = {
+            "server2": _Peer("server2", is_alive=True),
+            "server3": _Peer("server3", is_alive=False),
+        }
+        # alive = 1 (я) + 1 = 2, cluster_size = 3, 2*2 > 3 → кворум
+        assert m._has_quorum() is True
+
+    def test_three_nodes_minority_no_quorum(self):
+        """3 узла, я один (оба пира мертвы) — кворума нет."""
+        m = self._manager(peers=[
+            {"host": "h", "port": 2, "server_id": "server2"},
+            {"host": "h", "port": 3, "server_id": "server3"},
+        ])
+        m.heartbeat = MagicMock()
+        m.heartbeat.peers = {
+            "server2": _Peer("server2", is_alive=False),
+            "server3": _Peer("server3", is_alive=False),
+        }
+        # alive = 1, cluster_size = 3, 1*2 > 3 ложно → нет кворума
+        assert m._has_quorum() is False
+
+    def test_unconfirmed_peers_do_not_count(self):
+        """На старте пиры is_alive=True, но ever_seen=False — кворума нет."""
+        m = self._manager(peers=[
+            {"host": "h", "port": 2, "server_id": "server2"},
+            {"host": "h", "port": 3, "server_id": "server3"},
+        ])
+        m.heartbeat = MagicMock()
+        m.heartbeat.peers = {
+            # оптимистично «живы», но ни разу не подтверждены heartbeat'ом
+            "server2": _Peer("server2", is_alive=True, ever_seen=False),
+            "server3": _Peer("server3", is_alive=True, ever_seen=False),
+        }
+        assert m._has_quorum() is False
+
+    def test_quorum_status_reports_counts(self):
+        m = self._manager(peers=[
+            {"host": "h", "port": 2, "server_id": "server2"},
+            {"host": "h", "port": 3, "server_id": "server3"},
+        ])
+        m.heartbeat = MagicMock()
+        m.heartbeat.peers = {
+            "server2": _Peer("server2", is_alive=True),
+            "server3": _Peer("server3", is_alive=False),
+        }
+        st = m.get_quorum_status()
+        assert st == {"has_quorum": True, "alive": 2, "cluster_size": 3, "needed": 2}
+
+    @pytest.mark.asyncio
+    async def test_become_master_refused_without_quorum(self):
+        """Без кворума узел не становится master (остаётся slave)."""
+        from cluster.election import BullyElection
+        el = BullyElection(
+            server_id="server3", host="h", port=3,
+            peers=[{"host": "h", "port": 1, "server_id": "server1"}],
+        )
+        el.set_quorum_source(lambda: False)
+        el._broadcast_coordinator = AsyncMock()
+        el.on_become_master = AsyncMock()
+
+        await el._become_master()
+
+        assert el.state.is_master is False
+        assert el.state.election_in_progress is False
+        el._broadcast_coordinator.assert_not_called()
+        el.on_become_master.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_become_master_allowed_with_quorum(self):
+        """При кворуме становление master проходит как обычно."""
+        from cluster.election import BullyElection
+        el = BullyElection(
+            server_id="server3", host="h", port=3,
+            peers=[{"host": "h", "port": 1, "server_id": "server1"}],
+        )
+        el.set_quorum_source(lambda: True)
+        el._broadcast_coordinator = AsyncMock()
+        el.on_become_master = AsyncMock()
+        el.on_master_changed = AsyncMock()
+
+        await el._become_master()
+
+        assert el.state.is_master is True
+        el._broadcast_coordinator.assert_called_once()
+
+
+class TestFencing:
+    """Fencing по term: реплика отвергает WAL от устаревшего master — Этап 4.1."""
+
+    def _repl(self, database, term=0):
+        from cluster.replication import WALReplication
+        r = WALReplication("server2", database.connection, is_master=False)
+        r.set_term_source(lambda: term)
+        return r
+
+    @pytest.mark.asyncio
+    async def test_should_accept_term_rejects_stale(self, database):
+        """term ниже виденного отвергается, свежий — принимается и поднимает пол."""
+        r = self._repl(database, term=0)
+        assert r.should_accept_term(5) is True   # принят, пол = 5
+        assert r.should_accept_term(4) is False  # старее пола → отказ
+        assert r.should_accept_term(5) is True   # равен полу → ок
+        assert r.should_accept_term(6) is True   # новее → ок, пол = 6
+        assert r.should_accept_term(5) is False  # снова старее → отказ
+
+    @pytest.mark.asyncio
+    async def test_election_term_sets_floor(self, database):
+        """Пол fencing учитывает актуальный term выборов, а не только пуши."""
+        r = self._repl(database, term=7)  # выборы уже на term 7
+        assert r.should_accept_term(6) is False  # master с term 6 — устаревший
+        assert r.should_accept_term(7) is True
+
+    @pytest.mark.asyncio
+    async def test_handle_wal_replication_fences_stale_term(self, database):
+        """handle_wal_replication возвращает 409 на WAL со старым term."""
+        from cluster.peer_handler import handle_wal_replication
+        r = self._repl(database, term=5)
+        cluster = MagicMock()
+        cluster.replication = r
+
+        request = MagicMock()
+        request.app = {"cluster": cluster}
+        request.json = AsyncMock(return_value={"term": 3, "entries": []})
+
+        resp = await handle_wal_replication(request)
+        assert resp.status == 409
+
+    @pytest.mark.asyncio
+    async def test_handle_wal_replication_accepts_current_term(self, database):
+        """WAL с актуальным term принимается (ack)."""
+        from cluster.peer_handler import handle_wal_replication
+        r = self._repl(database, term=5)
+        cluster = MagicMock()
+        cluster.replication = r
+
+        request = MagicMock()
+        request.app = {"cluster": cluster}
+        request.json = AsyncMock(return_value={"term": 5, "entries": []})
+
+        resp = await handle_wal_replication(request)
+        assert resp.status == 200

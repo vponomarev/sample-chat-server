@@ -21,6 +21,11 @@ class ServerInfo:
     role: str = "slave"  # master, slave
     term: int = 0
     is_alive: bool = True
+    # Был ли пир хоть раз реально подтверждён (успешный heartbeat). На старте
+    # is_alive оптимистично True, но пир ещё не отвечал — для кворума (Этап 4.1)
+    # это важно: одинокий узел не должен считать неподтверждённых пиров живыми и
+    # становиться master в меньшинстве. Ставится в True при первом успехе.
+    ever_seen: bool = False
     last_heartbeat: float = field(default_factory=time.time)
     consecutive_failures: int = 0
     uptime: int = 0
@@ -141,6 +146,7 @@ class HeartbeatManager:
                 # Обновление информации о пире
                 was_alive = peer.is_alive
                 peer.is_alive = True
+                peer.ever_seen = True  # подтверждён — теперь учитывается в кворуме
                 peer.last_heartbeat = time.time()
                 peer.consecutive_failures = 0
                 peer.role = data.get("role", "slave")

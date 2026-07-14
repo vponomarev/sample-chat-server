@@ -336,3 +336,96 @@ async def _wait_for_count(node, client_msg_id: str, expected: int, timeout: floa
             return last
         await asyncio.sleep(POLL_INTERVAL)
     return last
+
+
+async def _get_state(session: aiohttp.ClientSession, port: int):
+    """Возвращает dict из /cluster/state или None, если узел недоступен."""
+    try:
+        async with session.get(
+            f"http://127.0.0.1:{port}/cluster/state",
+            timeout=aiohttp.ClientTimeout(total=2),
+        ) as resp:
+            if resp.status != 200:
+                return None
+            return await resp.json()
+    except Exception:
+        return None
+
+
+@pytest.fixture
+def lonely_node():
+    """
+    Поднимает ОДИН узел из кластера на 3 (пиры указывают на порты, которые
+    никто не слушает). Узел — в меньшинстве и не должен становиться master.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="chat-minority-")
+    port = _free_port()
+    # Два «мёртвых» пира: свободные порты, на которых никто не поднимается.
+    dead_ports = [_free_port(), _free_port()]
+    peers = (
+        f"server2@127.0.0.1:{dead_ports[0]},"
+        f"server3@127.0.0.1:{dead_ports[1]}"
+    )
+    node = _Node(
+        server_id="server1",
+        port=port,
+        db_path=Path(tmpdir) / "server1.db",
+        peers=peers,
+        log_path=Path(tmpdir) / "server1.log",
+    )
+    node.start()
+
+    yield node
+
+    node.stop()
+    __import__("shutil").rmtree(tmpdir, ignore_errors=True)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_minority_node_never_becomes_master(lonely_node):
+    """
+    Анти-split-brain (issue #11, Этап 4.1): узел в меньшинстве (видит только
+    себя из кластера в 3 узла) НИКОГДА не становится master и не готов
+    принимать трафик — иначе при сетевом разделении появился бы второй master.
+
+    Проверяем устойчиво в течение окна времени (а не разово): узел не должен
+    даже кратко «мелькнуть» мастером, пока не подтвердит большинство.
+    """
+    node = lonely_node
+
+    async with aiohttp.ClientSession() as session:
+        # Даём узлу время на старт, начальные выборы и несколько тиков
+        # heartbeat/метрик — достаточно, чтобы «мелькнуть» мастером, если бы
+        # кворум не защищал.
+        observed = []
+        deadline = time.monotonic() + 20.0
+        # Сначала дождёмся, что узел вообще поднялся и отвечает.
+        while time.monotonic() < deadline:
+            state = await _get_state(session, node.port)
+            if state:
+                observed.append(state)
+                break
+            await asyncio.sleep(POLL_INTERVAL)
+        assert observed, "Одиночный узел не поднялся / не отвечает на /cluster/state"
+
+        # Наблюдаем ~12s: роль всё это время должна оставаться slave, кворума нет.
+        watch_until = time.monotonic() + 12.0
+        while time.monotonic() < watch_until:
+            state = await _get_state(session, node.port)
+            assert state is not None
+            role = state["election"]["role"]
+            quorum = state.get("quorum", {})
+            assert role == "slave", (
+                f"Узел в меньшинстве стал '{role}' — split-brain возможен! "
+                f"quorum={quorum}"
+            )
+            assert quorum.get("has_quorum") is False, f"Неожиданный кворум: {quorum}"
+            assert state["replication"]["is_master"] is False
+            await asyncio.sleep(POLL_INTERVAL)
+
+        # И не готов принимать трафик (readiness): мастера нет.
+        async with session.get(
+            f"http://127.0.0.1:{node.port}/health/ready"
+        ) as resp:
+            assert resp.status == 503

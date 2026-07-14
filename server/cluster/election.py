@@ -71,6 +71,13 @@ class BullyElection:
         # опирается на heartbeat). Если не задан — считаем всех пиров живыми.
         self._alive_higher_source: Optional[Callable] = None
 
+        # Источник кворума (инъектируется из ClusterManager): есть ли у нас
+        # большинство живых узлов кластера. Master становятся только при
+        # кворуме — иначе меньшинство при сетевом разделении выбрало бы своего
+        # master и получился бы split-brain (issue #11, Этап 4.1). Если источник
+        # не задан (одиночный узел / часть тестов) — считаем, что кворум есть.
+        self._quorum_source: Optional[Callable] = None
+
         # Таймауты
         self.election_timeout = 3.0  # секунды ожидания ответа на выборы
         self.coordinator_timeout = 2.0  # секунды на рассылку coordinator
@@ -84,7 +91,20 @@ class BullyElection:
         объектов с атрибутом ``server_id``.
         """
         self._alive_higher_source = source
-    
+
+    def set_quorum_source(self, source: Callable):
+        """
+        Задаёт функцию, возвращающую ``True``, если узел видит большинство
+        живых узлов кластера (кворум). Обычно ``ClusterManager._has_quorum``.
+        """
+        self._quorum_source = source
+
+    def _has_quorum(self) -> bool:
+        """Есть ли кворум. Без источника (одиночный режим) — считаем, что да."""
+        if self._quorum_source is None:
+            return True
+        return bool(self._quorum_source())
+
     @property
     def numeric_id(self) -> int:
         """Числовой ID сервера."""
@@ -271,6 +291,18 @@ class BullyElection:
 
     async def _become_master(self):
         """Стать master."""
+        # Кворум (issue #11, Этап 4.1): не становимся master, если не видим
+        # большинство узлов. Так меньшинство при сетевом разделении остаётся
+        # без master (недоступно на запись), но не плодит второго master —
+        # split-brain по записи невозможен.
+        if not self._has_quorum():
+            logging.warning(
+                "[Election] Нет кворума — остаёмся slave, master не становимся"
+            )
+            self.state.election_in_progress = False
+            self.state.is_master = False
+            return
+
         self.state.is_master = True
         self.state.master_id = self.server_id
         self.state.election_in_progress = False

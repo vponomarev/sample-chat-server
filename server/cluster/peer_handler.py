@@ -85,9 +85,22 @@ async def handle_wal_replication(request: web.Request) -> web.Response:
     
     data = await request.json()
     entries = data.get("entries", [])
-    
-    logging.debug(f"[Cluster] Получено WAL записей: {len(entries)}")
-    
+    term = data.get("term", 0)
+
+    # Fencing (issue #11, Этап 4.1): отвергаем WAL от master со старым term —
+    # это «зомби»-master, переживший сетевое разделение. 409 Conflict.
+    if not cluster.replication.should_accept_term(term):
+        logging.warning(
+            f"[Cluster] WAL отклонён fencing'ом: term={term} ниже виденного"
+        )
+        return web.json_response(
+            {"ack": False, "reason": "fenced (stale term)",
+             "last_applied_seq": cluster.replication.last_applied_seq},
+            status=409,
+        )
+
+    logging.debug(f"[Cluster] Получено WAL записей: {len(entries)} (term={term})")
+
     acked = []
     for entry in entries:
         success = await cluster.replication.apply_wal_entry(entry)
@@ -161,7 +174,10 @@ async def handle_cluster_state(request: web.Request) -> web.Response:
         "replication": {
             "is_master": cluster.replication.is_master if cluster.replication else False,
             "lag": cluster.replication.get_lag() if cluster.replication else 0
-        } if cluster.replication else {}
+        } if cluster.replication else {},
+        # Кворум (Этап 4.1): видно ли большинство узлов — ключевой признак,
+        # может ли узел быть master (анти-split-brain).
+        "quorum": cluster.get_quorum_status() if hasattr(cluster, "get_quorum_status") else {},
     }
     
     return web.json_response(state)

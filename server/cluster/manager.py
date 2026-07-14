@@ -87,6 +87,48 @@ class ClusterManager:
             for p in self.heartbeat.peers.values()
         )
 
+    def _has_quorum(self) -> bool:
+        """
+        Видим ли мы большинство узлов кластера (issue #11, Этап 4.1).
+
+        Кворум = строгое большинство: (живые, включая себя) * 2 > размер кластера.
+        Размер кластера = число сконфигурированных пиров + 1 (мы сами).
+
+        Зачем: master разрешаем только при кворуме. При сетевом разделении
+        большинство останется ровно с одной стороны — только она сможет иметь
+        master. Меньшинство станет недоступным на запись, но второго master не
+        появится → нет split-brain и расхождения данных. Одиночный узел (пиров
+        нет) всегда имеет кворум (1*2 > 1).
+
+        Замечание для демо: в кластере из 2 узлов кворум = 2, т.е. падение
+        любого узла лишает кластер master. Это корректная цена кворума —
+        отказоустойчивость к split-brain требует нечётного числа узлов (3+).
+        """
+        if not self.heartbeat:
+            return True
+        cluster_size = len(self.peers) + 1
+        # Учитываем только подтверждённых пиров (ever_seen): на старте is_alive
+        # оптимистично True, и без этого одинокий узел мгновенно набрал бы
+        # «кворум» из ни разу не отвечавших пиров и стал master в меньшинстве.
+        alive_including_self = 1 + sum(
+            1 for p in self.heartbeat.peers.values() if p.is_alive and p.ever_seen
+        )
+        return alive_including_self * 2 > cluster_size
+
+    def get_quorum_status(self) -> Dict:
+        """Состояние кворума для наблюдаемости (/cluster/state)."""
+        cluster_size = len(self.peers) + 1
+        alive = 1 + (
+            sum(1 for p in self.heartbeat.peers.values() if p.is_alive and p.ever_seen)
+            if self.heartbeat else 0
+        )
+        return {
+            "has_quorum": self._has_quorum(),
+            "alive": alive,
+            "cluster_size": cluster_size,
+            "needed": cluster_size // 2 + 1,
+        }
+
     async def start(self):
         """Запуск кластера."""
         logging.info("[Cluster] Запуск...")
@@ -145,8 +187,14 @@ class ClusterManager:
             self.heartbeat.get_alive_peers_with_higher_id
         )
 
+        # Master становятся только при кворуме (анти-split-brain, Этап 4.1)
+        self.election.set_quorum_source(self._has_quorum)
+
         # Репликация знает, у кого догонять WAL (текущий master)
         self.replication.set_master_locator(self.get_master_server)
+
+        # Fencing: реплика штампует/сверяет term из выборов (Этап 4.1)
+        self.replication.set_term_source(lambda: self.election.term)
 
         # Запуск компонентов
         await self.heartbeat.start()
@@ -204,15 +252,28 @@ class ClusterManager:
                 else:
                     update_replication_lag(0, self.server_id)
 
+                # Кворум-fencing (Этап 4.1): master, потерявший большинство
+                # (оказался в меньшинстве при сетевом разделении), слагает
+                # полномочия. Иначе он остался бы «зомби»-master и после
+                # заживления сети конфликтовал бы с master из большинства.
+                # Проверяем до остальных триггеров — это приоритетнее.
+                if self.is_master and not self._has_quorum():
+                    logging.warning(
+                        "[Cluster] Потерян кворум — master слагает полномочия"
+                    )
+                    await self.election.step_down()
+
                 # Страховочная проверка живости master: если мы не master,
-                # выборы не идут и живого master нет — инициируем выборы.
-                # Дополняет реактивный триггер в _on_peer_down.
-                if (
+                # выборы не идут, живого master нет и у нас есть кворум —
+                # инициируем выборы. Без кворума молчим: меньшинство корректно
+                # остаётся без master, а не крутит бесполезные выборы.
+                elif (
                     self.election
                     and self.heartbeat
                     and not self.is_master
                     and not self.election.state.election_in_progress
                     and not self.heartbeat.is_master_alive()
+                    and self._has_quorum()
                 ):
                     logging.info("[Cluster] Master не обнаружен — запуск выборов")
                     await self.election.start_election()

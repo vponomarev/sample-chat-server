@@ -92,6 +92,15 @@ class WALReplication:
         # Локатор master (инъектируется из ClusterManager) для запроса догона
         self._master_locator: Optional[Callable] = None
 
+        # Fencing по term (issue #11, Этап 4.1): master штампует свой term в
+        # каждом WAL-пуше, реплика отвергает пуш со term ниже уже виденного.
+        # Так «старый» master, переживший сетевое разделение, после заживления
+        # сети не перезапишет данные, принятые от нового master с большим term.
+        # _fencing_term — наибольший term, от которого мы принимали записи;
+        # _term_source отдаёт актуальный term из выборов (инъектируется).
+        self._fencing_term = 0
+        self._term_source: Optional[Callable] = None
+
         # По одному circuit breaker на пира: не долбим недоступную реплику
         # каждым сообщением (issue B11, Этап 3.2).
         self._breakers: Dict[str, CircuitBreaker] = {}
@@ -121,6 +130,29 @@ class WALReplication:
     def set_master_locator(self, locator: Callable):
         """Задаёт функцию, возвращающую dict master-сервера {host, port} (или None)."""
         self._master_locator = locator
+
+    def set_term_source(self, source: Callable):
+        """Задаёт функцию, возвращающую текущий term выборов (для fencing)."""
+        self._term_source = source
+
+    def _current_term(self) -> int:
+        """Актуальный term (из выборов). Без источника — 0."""
+        return int(self._term_source()) if self._term_source else 0
+
+    def should_accept_term(self, term: int) -> bool:
+        """
+        Fencing-проверка (Этап 4.1): принимать ли WAL-пуш с данным term.
+
+        Отвергаем всё, что ниже наибольшего term, который мы уже видели (от
+        выборов или от прежних принятых пушей) — это записи от устаревшего
+        master. Пуш с term >= порога принимаем и запоминаем term как новый пол.
+        """
+        floor = max(self._fencing_term, self._current_term())
+        if term < floor:
+            return False
+        if term > self._fencing_term:
+            self._fencing_term = term
+        return True
     
     async def start(self):
         """Запуск репликации."""
@@ -312,6 +344,7 @@ class WALReplication:
 
         payload = {
             "type": "WAL_APPEND",
+            "term": self._current_term(),  # для fencing на стороне реплики
             "entries": [e.to_dict() for e in entries],
         }
         result = await self._send_wal_to_peer(peer, payload)
