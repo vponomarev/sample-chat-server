@@ -70,6 +70,17 @@ PEERS = os.getenv("PEERS", "")
 # В проде задаётся через env CLUSTER_SECRET, а не хранится в репозитории.
 CLUSTER_SECRET = os.getenv("CLUSTER_SECRET", _CLUSTER.get("secret", ""))
 
+# Режим репликации (Этап 4.2):
+#   "async" (умолч.) — master отвечает клиенту сразу, реплики догоняют фоном
+#                      (низкая задержка, но свежая запись может пропасть при
+#                      падении master до репликации);
+#   "sync"           — master подтверждает запись только после того, как её
+#                      получило большинство узлов (durable на кворуме, но выше
+#                      задержка и зависимость от доступности реплик).
+REPLICATION_MODE = os.getenv(
+    "REPLICATION_MODE", _CLUSTER.get("replication_mode", "async")
+).lower()
+
 
 def parse_peers(peers_str: str) -> list:
     """
@@ -138,6 +149,7 @@ def get_config() -> dict:
         "ws_heartbeat_timeout": WS_HEARTBEAT_TIMEOUT,
         "cluster_enabled": CLUSTER_ENABLED,
         "cluster_secret": CLUSTER_SECRET,
+        "replication_mode": REPLICATION_MODE,
         "peers": PEERS_LIST,
         "log_level": LOG_LEVEL,
         "log_format": LOG_FORMAT,

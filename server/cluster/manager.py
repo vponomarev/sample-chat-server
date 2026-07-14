@@ -40,7 +40,8 @@ class ClusterManager:
         port: int,
         peers: List[Dict],
         db_connection,
-        secret: str = ""
+        secret: str = "",
+        replication_mode: str = "async"
     ):
         self.app = app
         self.server_id = server_id
@@ -49,6 +50,7 @@ class ClusterManager:
         self.db = db_connection
         self.peers = peers
         self.secret = secret
+        self.replication_mode = replication_mode
         self.start_time = time.time()
 
         # Компоненты
@@ -179,7 +181,8 @@ class ClusterManager:
             db_connection=self.db,
             is_master=False,
             peers=self.peers,
-            secret=self.secret
+            secret=self.secret,
+            replication_mode=self.replication_mode
         )
 
         # Выборы опираются на актуальную живость пиров из heartbeat
@@ -189,6 +192,10 @@ class ClusterManager:
 
         # Master становятся только при кворуме (анти-split-brain, Этап 4.1)
         self.election.set_quorum_source(self._has_quorum)
+
+        # Живого master узел принимает по heartbeat, не дожидаясь COORDINATOR
+        # (устойчивость к гонке term при кворум-задержке на старте, Этап 4.1)
+        self.election.set_master_alive_source(self.heartbeat.get_master)
 
         # Репликация знает, у кого догонять WAL (текущий master)
         self.replication.set_master_locator(self.get_master_server)
@@ -283,6 +290,19 @@ class ClusterManager:
                 if self.is_master and self.heartbeat and self._higher_master_alive():
                     logging.warning("[Cluster] Обнаружен master с большим ID — уступаем")
                     await self.election.step_down()
+
+                # Backstop: если мы не master, но heartbeat видит живого master,
+                # а наше состояние выборов ещё его не знает — принимаем его
+                # (страховка к адопции в самих выборах, Этап 4.1).
+                if (
+                    self.election
+                    and self.heartbeat
+                    and not self.is_master
+                    and not self.election.state.election_in_progress
+                ):
+                    master = self.heartbeat.get_master()
+                    if master and self.election.state.master_id != master.server_id:
+                        self.election._adopt_if_master_present()
 
                 await asyncio.sleep(5)
             except asyncio.CancelledError:

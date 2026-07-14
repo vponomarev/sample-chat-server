@@ -173,7 +173,8 @@ async def handle_cluster_state(request: web.Request) -> web.Response:
         "heartbeat": cluster.heartbeat.get_cluster_state() if cluster.heartbeat else {},
         "replication": {
             "is_master": cluster.replication.is_master if cluster.replication else False,
-            "lag": cluster.replication.get_lag() if cluster.replication else 0
+            "lag": cluster.replication.get_lag() if cluster.replication else 0,
+            "mode": cluster.replication.replication_mode if cluster.replication else "async",
         } if cluster.replication else {},
         # Кворум (Этап 4.1): видно ли большинство узлов — ключевой признак,
         # может ли узел быть master (анти-split-brain).

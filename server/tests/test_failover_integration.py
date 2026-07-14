@@ -122,7 +122,9 @@ async def _get_health(session: aiohttp.ClientSession, port: int):
     try:
         async with session.get(
             f"http://127.0.0.1:{port}/cluster/health",
-            timeout=aiohttp.ClientTimeout(total=2),
+            # 5s (как клиентские таймауты кластера): под нагрузкой живой узел
+            # может ответить дольше 2s, иначе тест ложно счёл бы его недоступным.
+            timeout=aiohttp.ClientTimeout(total=5),
         ) as resp:
             if resp.status != 200:
                 return None

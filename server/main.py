@@ -35,7 +35,8 @@ async def on_startup(app: web.Application):
             port=config["port"],
             peers=config["peers"],
             db_connection=db.connection,
-            secret=config.get("cluster_secret", "")
+            secret=config.get("cluster_secret", ""),
+            replication_mode=config.get("replication_mode", "async")
         )
         app["cluster"] = cluster
         await cluster.start()

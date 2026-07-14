@@ -24,6 +24,13 @@ RETRY_INTERVAL_SEC = 2.0
 # демо; в проде порог был бы куда больше.
 SNAPSHOT_WAL_THRESHOLD = 1000
 
+# Синхронная репликация (Этап 4.2): сколько ждать подтверждения записи кворумом
+# реплик и как часто перепроверять/дослать. По таймауту master оставляет запись
+# у себя и логирует предупреждение (выбор доступности над строгой durability —
+# уместно для учебного стенда; в проде запись бы отклонялась/блокировалась).
+SYNC_ACK_TIMEOUT_SEC = 5.0
+SYNC_POLL_INTERVAL_SEC = 0.1
+
 
 @dataclass
 class WALEntry:
@@ -74,13 +81,16 @@ class WALReplication:
         db_connection: Connection,
         is_master: bool = False,
         peers: List[Dict] = None,
-        secret: str = ""
+        secret: str = "",
+        replication_mode: str = "async"
     ):
         self.server_id = server_id
         self.db = db_connection
         self.is_master = is_master
         self.peers = peers or []
         self.secret = secret
+        # "async" (умолч.) или "sync" — см. config.REPLICATION_MODE (Этап 4.2)
+        self.replication_mode = replication_mode
         
         # Состояние
         self._last_applied_seq = 0
@@ -315,10 +325,51 @@ class WALReplication:
         # Отправка slave: шлём каждому пиру всё после его подтверждённого seq
         await self._replicate_pending()
 
+        # Синхронный режим (Этап 4.2): не возвращаем управление (а значит, и не
+        # подтверждаем клиенту), пока запись не примет большинство узлов.
+        if self.replication_mode == "sync":
+            await self._await_quorum_ack(seq)
+
         return seq
 
     def _peer_id(self, peer: Dict) -> str:
         return peer.get("server_id", f"{peer['host']}:{peer['port']}")
+
+    def _quorum_acked(self, seq: int) -> bool:
+        """
+        Приняло ли запись ``seq`` большинство узлов кластера (Этап 4.2).
+
+        Master уже имеет запись (это +1), считаем реплики, чей подтверждённый
+        seq достиг нужного. Кворум = строгое большинство: ``acked * 2 > N``.
+        """
+        cluster_size = len(self.peers) + 1
+        acked = 1  # сам master
+        for peer in self.peers:
+            pid = self._peer_id(peer)
+            if pid != self.server_id and self._peer_acked.get(pid, 0) >= seq:
+                acked += 1
+        return acked * 2 > cluster_size
+
+    async def _await_quorum_ack(self, seq: int):
+        """
+        Ждёт подтверждения записи ``seq`` кворумом реплик (Этап 4.2), периодически
+        дослывая бэклог отстающим. По таймауту оставляет запись у master и громко
+        предупреждает — durability на кворуме не гарантирована для этой записи.
+        """
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + SYNC_ACK_TIMEOUT_SEC
+        while not self._quorum_acked(seq):
+            if loop.time() >= deadline:
+                logging.warning(
+                    f"[WAL] sync: запись seq={seq} не подтверждена кворумом за "
+                    f"{SYNC_ACK_TIMEOUT_SEC}s — оставляю на master (не durable на кворуме)"
+                )
+                return False
+            # Дослать отстающим и подождать немного до следующей проверки.
+            await self._replicate_pending()
+            await asyncio.sleep(SYNC_POLL_INTERVAL_SEC)
+        logging.debug(f"[WAL] sync: запись seq={seq} подтверждена кворумом")
+        return True
 
     async def _replicate_pending(self):
         """Досылает каждому пиру WAL-записи после его подтверждённого seq."""

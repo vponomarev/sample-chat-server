@@ -78,6 +78,15 @@ class BullyElection:
         # не задан (одиночный узел / часть тестов) — считаем, что кворум есть.
         self._quorum_source: Optional[Callable] = None
 
+        # Источник живого master (обычно heartbeat.get_master). Если кластер уже
+        # видит живого master через heartbeat, узел принимает его напрямую, не
+        # дожидаясь COORDINATOR и не устраивая выборы. Это критично при кворум-
+        # задержке становления master на старте (Этап 4.1): иначе младший узел
+        # крутил бы выборы, инфлируя term, и потом отвергал бы COORDINATOR
+        # старшего по своему же раздутому term. Возвращает объект с полями
+        # server_id/term или None.
+        self._master_alive_source: Optional[Callable] = None
+
         # Таймауты
         self.election_timeout = 3.0  # секунды ожидания ответа на выборы
         self.coordinator_timeout = 2.0  # секунды на рассылку coordinator
@@ -104,6 +113,38 @@ class BullyElection:
         if self._quorum_source is None:
             return True
         return bool(self._quorum_source())
+
+    def set_master_alive_source(self, source: Callable):
+        """Задаёт источник живого master (обычно ``heartbeat.get_master``)."""
+        self._master_alive_source = source
+
+    def _adopt_if_master_present(self) -> bool:
+        """
+        Если через heartbeat виден живой master (не мы) — принимаем его: берём
+        его master_id и авторитетный term, прекращаем выборы. Возвращает True,
+        если приняли. Так младший узел не воюет за лидерство и не отвергает
+        репликацию из-за раздутого собственного term (Этап 4.1/4.2).
+        """
+        if self._master_alive_source is None:
+            return False
+        master = self._master_alive_source()
+        if not master or getattr(master, "server_id", None) == self.server_id:
+            return False
+
+        master_id = master.server_id
+        master_term = getattr(master, "term", self.state.current_term)
+        changed = self.state.master_id != master_id
+        self.state.master_id = master_id
+        self.state.is_master = False
+        self.state.election_in_progress = False
+        # Принимаем авторитетный term master'а (в т.ч. если наш раздулся выше).
+        self.state.current_term = master_term
+        if changed:
+            logging.info(
+                f"[Election] Принят живой master {master_id} (term={master_term}) "
+                f"без COORDINATOR (по heartbeat)"
+            )
+        return True
 
     @property
     def numeric_id(self) -> int:
@@ -148,7 +189,12 @@ class BullyElection:
         if self.state.election_in_progress:
             logging.debug("[Election] Выборы уже идут")
             return
-        
+
+        # Уже есть живой master (узнали через heartbeat)? Принимаем его вместо
+        # выборов — не воюем за лидерство и не плодим шторм на старте.
+        if self._adopt_if_master_present():
+            return
+
         self.state.election_in_progress = True
         self.state.current_term += 1
         self.state.voted_for = self.server_id
@@ -182,10 +228,15 @@ class BullyElection:
             logging.debug("[Election] Получен OK, ждём coordinator...")
             await asyncio.sleep(self.election_timeout)
             
-            # Если coordinator не пришёл - начинаем новые выборы
+            # Если coordinator не пришёл — сперва проверяем, не появился ли уже
+            # живой master (частая ситуация при кворум-задержке на старте: старший
+            # узел стал master и виден по heartbeat, но COORDINATOR разошёлся с
+            # нашим term). Если да — принимаем его. Иначе перезапускаем выборы.
             if self.state.election_in_progress:
-                logging.warning("[Election] Coordinator не получен, перезапуск выборов")
                 self.state.election_in_progress = False
+                if self._adopt_if_master_present():
+                    return
+                logging.warning("[Election] Coordinator не получен, перезапуск выборов")
                 await self.start_election()
         else:
             # Никто не ответил - становимся master

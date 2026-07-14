@@ -1036,3 +1036,91 @@ class TestFencing:
 
         resp = await handle_wal_replication(request)
         assert resp.status == 200
+
+
+class TestSyncReplication:
+    """Синхронная репликация: подтверждение после кворума — Этап 4.2."""
+
+    def _repl(self, database, peers, mode="sync"):
+        from cluster.replication import WALReplication
+        return WALReplication(
+            "server1", database.connection, is_master=True,
+            peers=peers, replication_mode=mode,
+        )
+
+    _PEERS = [
+        {"host": "h", "port": 2, "server_id": "server2"},
+        {"host": "h", "port": 3, "server_id": "server3"},
+    ]
+
+    def test_quorum_acked_standalone(self, database):
+        """Одиночный master (без пиров) — сам себе кворум."""
+        r = self._repl(database, peers=[])
+        assert r._quorum_acked(1) is True
+
+    def test_quorum_acked_needs_majority(self, database):
+        """3 узла: только master (1/3) — нет кворума; +1 реплика (2/3) — есть."""
+        r = self._repl(database, peers=self._PEERS)
+        assert r._quorum_acked(5) is False
+        r._peer_acked["server2"] = 5
+        assert r._quorum_acked(5) is True
+
+    def test_quorum_acked_ignores_lagging_peer(self, database):
+        """Реплика с подтверждённым seq ниже нужного в кворум не идёт."""
+        r = self._repl(database, peers=self._PEERS)
+        r._peer_acked["server2"] = 4  # отстаёт на одну запись
+        assert r._quorum_acked(5) is False
+
+    @pytest.mark.asyncio
+    async def test_log_operation_sync_returns_after_quorum(self, database):
+        """В sync-режиме log_operation возвращается, когда запись принял кворум."""
+        r = self._repl(database, peers=self._PEERS)
+
+        sess = MagicMock()
+
+        def _post(url, **kw):
+            last = kw["json"]["entries"][-1]["seq"]
+            return _JsonCM({"ack": True, "last_applied_seq": last})
+
+        sess.post.side_effect = _post
+        r._session = sess
+
+        seq = await r.log_operation(
+            "INSERT", "users", {"nick": "a", "password": None, "created_at": 1})
+        assert seq == 1
+        assert r._quorum_acked(seq) is True
+
+    @pytest.mark.asyncio
+    async def test_log_operation_sync_times_out_without_quorum(self, database, monkeypatch):
+        """
+        Без кворума (реплики недоступны) sync-запись не висит вечно: по таймауту
+        возвращается, запись остаётся на master (durability не гарантирована).
+        """
+        import cluster.replication as repl_mod
+        monkeypatch.setattr(repl_mod, "SYNC_ACK_TIMEOUT_SEC", 0.3)
+        monkeypatch.setattr(repl_mod, "SYNC_POLL_INTERVAL_SEC", 0.05)
+
+        r = self._repl(database, peers=self._PEERS)
+        sess = MagicMock()
+        sess.post.side_effect = ConnectionError("replicas down")
+        r._session = sess
+
+        seq = await r.log_operation(
+            "INSERT", "users", {"nick": "a", "password": None, "created_at": 1})
+        assert seq == 1
+        assert r._quorum_acked(seq) is False
+        # Запись при этом реально записана в WAL master'а.
+        row = await database.fetchone("SELECT COUNT(*) AS c FROM wal")
+        assert row["c"] == 1
+
+    @pytest.mark.asyncio
+    async def test_async_mode_does_not_wait(self, database):
+        """В async-режиме (умолч.) log_operation не ждёт подтверждений."""
+        r = self._repl(database, peers=self._PEERS, mode="async")
+        sess = MagicMock()
+        sess.post.side_effect = ConnectionError("replicas down")
+        r._session = sess
+        # Не должно зависнуть/ждать таймаут, несмотря на недоступные реплики.
+        seq = await r.log_operation(
+            "INSERT", "users", {"nick": "a", "password": None, "created_at": 1})
+        assert seq == 1
