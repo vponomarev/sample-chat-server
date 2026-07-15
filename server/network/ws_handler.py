@@ -8,6 +8,11 @@ from aiohttp import web
 
 from irc.commands import CommandHandler
 from network.ws_manager import ConnectionRegistry
+from observability.correlation import (
+    new_correlation_id,
+    set_correlation_id,
+    reset_correlation_id,
+)
 from observability.metrics import (
     increment_websocket_connections,
     update_connected_clients,
@@ -56,11 +61,18 @@ async def handle_message(
     """Обработка входящего сообщения."""
     cmd = data.get("cmd", "").upper()
 
+    # Correlation id (Этап 5.4): берём присланный клиентом или генерируем свой.
+    # Живёт в контексте задачи всю обработку команды — попадёт в логи и в
+    # исходящие сообщения (их подмешивает ConnectionRegistry).
+    cid = str(data.get("correlation_id") or "").strip() or new_correlation_id()
+    token = set_correlation_id(cid)
+
     if not cmd:
         await command_handler.ws_manager.send_to(ws, {
             "event": "ERROR",
             "message": "Missing 'cmd' field"
         })
+        reset_correlation_id(token)
         return
 
     # Обработка команды
@@ -88,3 +100,4 @@ async def handle_message(
         duration = time.time() - start_time
         from observability.metrics import irc_command_duration_seconds
         irc_command_duration_seconds.labels(cmd=cmd).observe(duration)
+        reset_correlation_id(token)

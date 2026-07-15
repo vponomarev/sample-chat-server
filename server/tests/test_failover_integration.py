@@ -33,8 +33,10 @@ import pytest
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 SERVER_MAIN = PROJECT_ROOT / "server" / "main.py"
 
-# Запас по времени на образование кластера и на failover.
-CLUSTER_FORM_TIMEOUT = 30.0
+# Запас по времени на образование кластера и на failover. Значения щедрые: под
+# нагрузкой полного прогона (или при активном антивирусе/ИБ-агенте) подпроцессы-
+# узлы голодают по CPU и формируются дольше. Изолированно всё сходится за секунды.
+CLUSTER_FORM_TIMEOUT = 45.0
 FAILOVER_TIMEOUT = 40.0
 REPLICATION_TIMEOUT = 15.0
 POLL_INTERVAL = 0.5

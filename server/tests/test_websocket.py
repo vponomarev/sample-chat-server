@@ -71,6 +71,33 @@ class TestConnectionRegistry:
         await ws.close()
 
     @pytest.mark.asyncio
+    async def test_correlation_id_echoed_from_client(self, ws_client):
+        """Присланный клиентом correlation_id возвращается в ответе (трассировка)."""
+        ws = await ws_client.ws_connect("/ws")
+
+        await ws.send_json({"cmd": "UNKNOWN_CMD", "correlation_id": "trace-abc-1"})
+        msg = await ws.receive_json()
+
+        assert msg["event"] == "ERROR"
+        assert msg["correlation_id"] == "trace-abc-1"
+
+        await ws.close()
+
+    @pytest.mark.asyncio
+    async def test_correlation_id_generated_when_absent(self, ws_client):
+        """Если клиент не прислал id — сервер генерирует и возвращает свой."""
+        ws = await ws_client.ws_connect("/ws")
+
+        await ws.send_json({"cmd": "UNKNOWN_CMD"})
+        msg = await ws.receive_json()
+
+        assert msg["event"] == "ERROR"
+        cid = msg.get("correlation_id", "")
+        assert len(cid) == 12 and all(c in "0123456789abcdef" for c in cid)
+
+        await ws.close()
+
+    @pytest.mark.asyncio
     async def test_websocket_register_flow(self, ws_client):
         """Тест потока регистрации через WebSocket."""
         ws = await ws_client.ws_connect("/ws")
@@ -209,10 +236,40 @@ class TestWebSocketManager:
     async def test_send_to(self, ws_manager, mock_ws):
         """Тест отправки конкретному подключению."""
         await ws_manager.add_connection(mock_ws)
-        
+
         await ws_manager.send_to(mock_ws, {"event": "TEST"})
-        
+
         assert mock_ws.send_str.called
+
+    @pytest.mark.asyncio
+    async def test_send_to_injects_correlation_id(self, ws_manager, mock_ws):
+        """send_to подмешивает correlation_id из контекста (Этап 5.4)."""
+        from observability.correlation import set_correlation_id, reset_correlation_id
+
+        await ws_manager.add_connection(mock_ws)
+        token = set_correlation_id("ctx-cid-1")
+        try:
+            await ws_manager.send_to(mock_ws, {"event": "TEST"})
+        finally:
+            reset_correlation_id(token)
+
+        sent = json.loads(mock_ws.send_str.call_args.args[0])
+        assert sent["correlation_id"] == "ctx-cid-1"
+
+    @pytest.mark.asyncio
+    async def test_send_to_does_not_override_existing_correlation_id(self, ws_manager, mock_ws):
+        """Явно заданный в сообщении id не перетирается контекстным."""
+        from observability.correlation import set_correlation_id, reset_correlation_id
+
+        await ws_manager.add_connection(mock_ws)
+        token = set_correlation_id("ctx-cid-1")
+        try:
+            await ws_manager.send_to(mock_ws, {"event": "TEST", "correlation_id": "explicit"})
+        finally:
+            reset_correlation_id(token)
+
+        sent = json.loads(mock_ws.send_str.call_args.args[0])
+        assert sent["correlation_id"] == "explicit"
 
     def test_get_connected_count(self, ws_manager, mock_ws):
         """Тест подсчёта подключений."""

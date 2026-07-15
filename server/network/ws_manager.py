@@ -4,6 +4,20 @@ import logging
 from typing import Set, Dict
 from aiohttp import web
 
+from observability.correlation import get_correlation_id
+
+
+def _with_correlation(message: dict) -> dict:
+    """
+    Подмешивает correlation_id текущего контекста в исходящее сообщение
+    (Этап 5.4), не перетирая уже заданный. Так ACK/MESSAGE/ERROR несут id
+    команды, которая их породила, и клиент может связать их со своим запросом.
+    """
+    cid = get_correlation_id()
+    if cid and "correlation_id" not in message:
+        return {**message, "correlation_id": cid}
+    return message
+
 
 class ConnectionRegistry:
     """Управление WebSocket подключениями."""
@@ -75,7 +89,7 @@ class ConnectionRegistry:
             return
 
         import json
-        data = json.dumps(message)
+        data = json.dumps(_with_correlation(message))
 
         dead_connections = []
         for ws in self.room_connections[room]:
@@ -94,7 +108,7 @@ class ConnectionRegistry:
         """Отправка сообщения конкретному подключению."""
         import json
         try:
-            await ws.send_str(json.dumps(message))
+            await ws.send_str(json.dumps(_with_correlation(message)))
         except Exception:
             self.remove_connection(ws)
 

@@ -16,6 +16,11 @@ class JSONFormatter(logging.Formatter):
             "message": record.getMessage(),
         }
 
+        # Correlation id для трассировки пути запроса (Этап 5.4), если задан
+        cid = getattr(record, "correlation_id", "")
+        if cid:
+            log_data["correlation_id"] = cid
+
         # Добавляем дополнительные поля если есть
         if hasattr(record, "component"):
             log_data["component"] = record.component
@@ -45,11 +50,18 @@ def setup_logging(level: str = "INFO", fmt: str = "json"):
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(log_level)
 
+    # Фильтр проставляет correlation_id каждой записи из текущего контекста
+    # (Этап 5.4) — покрывает все логгеры, идущие через этот handler.
+    from observability.correlation import CorrelationIdFilter
+    console_handler.addFilter(CorrelationIdFilter())
+
     if str(fmt).lower() == "json":
         console_handler.setFormatter(JSONFormatter())
     else:
         console_handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+            logging.Formatter(
+                "%(asctime)s %(levelname)s [%(correlation_id)s] %(name)s: %(message)s"
+            )
         )
     root_logger.addHandler(console_handler)
 
