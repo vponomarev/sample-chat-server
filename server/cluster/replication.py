@@ -15,6 +15,7 @@ from aiosqlite import Connection
 
 from cluster.circuit_breaker import CircuitBreaker
 from cluster.snapshot import SnapshotManager
+from cluster.checksum import ChecksumManager
 
 # Период фоновой повторной доставки WAL отстающим пирам (Этап 3.3).
 RETRY_INTERVAL_SEC = 2.0
@@ -126,6 +127,9 @@ class WALReplication:
 
         # Снапшоты + компакция WAL (Этап 3.5)
         self._snapshots = SnapshotManager(db_connection)
+
+        # Сверка целостности реплик по контрольным суммам (Этап 4.4)
+        self._checksums = ChecksumManager(db_connection)
 
         logging.info(f"[WAL] Инициализирован для {server_id} (master={is_master})")
 
@@ -639,6 +643,82 @@ class WALReplication:
     async def load_snapshot(self) -> Optional[Dict]:
         """Последний снапшот для отдачи отстающему узлу (или None)."""
         return await self._snapshots.load_latest()
+
+    async def local_checksum(self) -> Dict:
+        """Контрольные суммы своих таблиц + позиция seq (Этап 4.4)."""
+        result = await self._checksums.compute()
+        result["seq"] = self._last_applied_seq
+        result["server_id"] = self.server_id
+        return result
+
+    async def verify_replicas(self) -> Dict:
+        """
+        Master: опрашивает контрольные суммы реплик и сравнивает со своими
+        (Этап 4.4). Различает отставание (seq реплики меньше — законно догоняет)
+        и настоящее расхождение (seq не меньше, а содержимое отличается).
+        """
+        local = await self.local_checksum()
+        replicas: List[Dict] = []
+        all_in_sync = True
+
+        for peer in self.peers:
+            peer_id = self._peer_id(peer)
+            if peer_id == self.server_id:
+                continue
+
+            remote = await self._fetch_peer_checksum(peer)
+            if remote is None:
+                replicas.append({"server_id": peer_id, "reachable": False})
+                all_in_sync = False
+                continue
+
+            in_sync = remote.get("overall") == local["overall"]
+            entry = {
+                "server_id": peer_id,
+                "reachable": True,
+                "in_sync": in_sync,
+                "seq": remote.get("seq"),
+            }
+            if not in_sync:
+                # Отстаёт (законно догоняет) vs разошёлся (реальная порча).
+                if remote.get("seq", 0) < local["seq"]:
+                    entry["status"] = "lagging"
+                else:
+                    entry["status"] = "diverged"
+                    all_in_sync = False
+                entry["diverging_tables"] = ChecksumManager.diverging_tables(local, remote)
+            else:
+                entry["status"] = "in_sync"
+            replicas.append(entry)
+
+        return {
+            "master": {
+                "server_id": self.server_id,
+                "overall": local["overall"],
+                "seq": local["seq"],
+                "counts": local["counts"],
+            },
+            "replicas": replicas,
+            "all_in_sync": all_in_sync,
+        }
+
+    async def _fetch_peer_checksum(self, peer: Dict) -> Optional[Dict]:
+        """GET контрольной суммы у пира (через circuit breaker). None при сбое."""
+        peer_id = self._peer_id(peer)
+        breaker = self._breaker(peer_id)
+        if not breaker.allow():
+            logging.debug(f"[WAL] Пропуск checksum {peer_id}: circuit {breaker.state}")
+            return None
+        try:
+            url = f"http://{peer['host']}:{peer['port']}/cluster/replication/checksum"
+            async with self._session.get(url, raise_for_status=True) as response:
+                data = await response.json()
+                breaker.record_success()
+                return data
+        except Exception as e:
+            breaker.record_failure()
+            logging.debug(f"[WAL] Не удалось получить checksum {peer_id}: {e}")
+            return None
 
     def get_lag(self) -> int:
         """Отставание репликации: сколько записей master ещё не применено."""

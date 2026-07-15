@@ -431,3 +431,71 @@ async def test_minority_node_never_becomes_master(lonely_node):
             f"http://127.0.0.1:{node.port}/health/ready"
         ) as resp:
             assert resp.status == 503
+
+
+async def _get_verify(session: aiohttp.ClientSession, port: int):
+    """Возвращает отчёт /cluster/replication/verify с master (или None).
+
+    Эндпоинт под /cluster/replication/* защищён кластерным секретом (узлы
+    поднимаются с секретом из config.yaml), поэтому шлём токен — как это делают
+    сами узлы.
+    """
+    from cluster.auth import auth_headers
+    from config import CLUSTER_SECRET
+    try:
+        async with session.get(
+            f"http://127.0.0.1:{port}/cluster/replication/verify",
+            headers=auth_headers(CLUSTER_SECRET),
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as resp:
+            if resp.status != 200:
+                return None
+            return await resp.json()
+    except Exception:
+        return None
+
+
+async def _wait_for_all_in_sync(session, port, timeout):
+    """Опрашивает verify у master, пока все реплики не сойдутся (или таймаут)."""
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        last = await _get_verify(session, port)
+        if last and last.get("all_in_sync"):
+            return last
+        await asyncio.sleep(POLL_INTERVAL)
+    return last
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_replica_integrity_checksums_match(cluster):
+    """
+    Сверка целостности (issue B18, Этап 4.4): после репликации записи master
+    через /cluster/replication/verify видит, что контрольные суммы всех реплик
+    совпадают с его собственными (data-уровень, а не только seq/lag).
+    """
+    nodes = cluster
+    by_id = {n.server_id: n for n in nodes}
+
+    async with aiohttp.ClientSession() as session:
+        master_id = await _wait_for_stable_cluster(
+            session, nodes, expected_master="server3", timeout=CLUSTER_FORM_TIMEOUT
+        )
+        master = by_id[master_id]
+
+        # Пишем сообщение и ждём репликации на все реплики.
+        await _send_message(
+            master.port, nick="carol", text="checksum me", client_msg_id="chk-1")
+        replicas = [n for n in nodes if n.server_id != master_id]
+        assert await _wait_for_replication(replicas, "chk-1"), \
+            "Сообщение не реплицировалось на все реплики"
+
+        # Master сверяет контрольные суммы реплик со своими.
+        report = await _wait_for_all_in_sync(
+            session, master.port, timeout=REPLICATION_TIMEOUT)
+
+        assert report is not None, "verify не ответил"
+        assert report["all_in_sync"] is True, f"Реплики разошлись: {report}"
+        statuses = {r["server_id"]: r.get("status") for r in report["replicas"]}
+        assert all(s == "in_sync" for s in statuses.values()), statuses

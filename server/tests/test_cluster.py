@@ -1124,3 +1124,127 @@ class TestSyncReplication:
         seq = await r.log_operation(
             "INSERT", "users", {"nick": "a", "password": None, "created_at": 1})
         assert seq == 1
+
+
+class TestChecksum:
+    """Сверка целостности реплик по контрольным суммам — issue B18, Этап 4.4."""
+
+    async def _insert_user(self, database, nick, ts):
+        await database.execute(
+            "INSERT INTO users (nick, password, created_at) VALUES (?, NULL, ?)",
+            (nick, ts))
+        await database.commit()
+
+    @pytest.mark.asyncio
+    async def test_compute_order_independent(self, database):
+        """Хеш зависит от содержимого, а не от порядка вставки строк."""
+        from cluster.checksum import ChecksumManager
+        cm = ChecksumManager(database.connection)
+
+        await self._insert_user(database, "b", 2)
+        await self._insert_user(database, "a", 1)
+        c1 = await cm.compute()
+
+        await database.execute("DELETE FROM users")
+        await database.commit()
+        await self._insert_user(database, "a", 1)
+        await self._insert_user(database, "b", 2)
+        c2 = await cm.compute()
+
+        assert c1["overall"] == c2["overall"]
+        assert c1["counts"]["users"] == 2
+
+    @pytest.mark.asyncio
+    async def test_compute_detects_change(self, database):
+        """Изменение данных меняет сумму только затронутой таблицы и общую."""
+        from cluster.checksum import ChecksumManager
+        cm = ChecksumManager(database.connection)
+
+        base = await cm.compute()
+        await self._insert_user(database, "x", 1)
+        changed = await cm.compute()
+
+        assert base["overall"] != changed["overall"]
+        assert base["tables"]["users"] != changed["tables"]["users"]
+        assert base["tables"]["rooms"] == changed["tables"]["rooms"]  # не тронута
+
+    def test_diverging_tables(self):
+        from cluster.checksum import ChecksumManager
+        a = {"tables": {"users": "h1", "rooms": "r", "messages": "m"}}
+        b = {"tables": {"users": "h2", "rooms": "r", "messages": "m"}}
+        assert ChecksumManager.diverging_tables(a, b) == ["users"]
+
+    def _master(self, database):
+        from cluster.replication import WALReplication
+        r = WALReplication(
+            "server1", database.connection, is_master=True,
+            peers=[
+                {"host": "h", "port": 2, "server_id": "server2"},
+                {"host": "h", "port": 3, "server_id": "server3"},
+            ],
+        )
+        r._last_applied_seq = 10
+        return r
+
+    def _session_returning(self, mapping):
+        """MagicMock-сессия: url c '//h:<port>/' → _JsonCM(mapping[port])."""
+        def _get(url, **kw):
+            for port, data in mapping.items():
+                if f"//h:{port}/" in url:
+                    if isinstance(data, Exception):
+                        raise data
+                    return _JsonCM(data)
+            raise AssertionError(f"неожиданный URL: {url}")
+        sess = MagicMock()
+        sess.get.side_effect = _get
+        return sess
+
+    @pytest.mark.asyncio
+    async def test_verify_in_sync_and_diverged(self, database):
+        """Реплика с той же суммой — in_sync; с другой при seq>=master — diverged."""
+        r = self._master(database)
+        local = await r.local_checksum()
+        r._session = self._session_returning({
+            2: {"overall": local["overall"], "seq": 10, "tables": local["tables"]},
+            3: {"overall": "DEADBEEF", "seq": 10, "tables": {"messages": "zzz"}},
+        })
+
+        report = await r.verify_replicas()
+        by = {x["server_id"]: x for x in report["replicas"]}
+
+        assert by["server2"]["status"] == "in_sync"
+        assert by["server3"]["status"] == "diverged"
+        assert "messages" in by["server3"]["diverging_tables"]
+        assert report["all_in_sync"] is False
+
+    @pytest.mark.asyncio
+    async def test_verify_lagging_not_flagged_as_divergence(self, database):
+        """Отставшая реплика (seq < master) — 'lagging', не ломает all_in_sync."""
+        r = self._master(database)
+        local = await r.local_checksum()
+        r._session = self._session_returning({
+            2: {"overall": local["overall"], "seq": 10, "tables": local["tables"]},
+            3: {"overall": "OTHER", "seq": 5, "tables": {}},  # отстаёт
+        })
+
+        report = await r.verify_replicas()
+        by = {x["server_id"]: x for x in report["replicas"]}
+
+        assert by["server3"]["status"] == "lagging"
+        assert report["all_in_sync"] is True
+
+    @pytest.mark.asyncio
+    async def test_verify_unreachable_peer(self, database):
+        """Недоступная реплика помечается reachable=False и роняет all_in_sync."""
+        r = self._master(database)
+        local = await r.local_checksum()
+        r._session = self._session_returning({
+            2: {"overall": local["overall"], "seq": 10, "tables": local["tables"]},
+            3: ConnectionError("down"),
+        })
+
+        report = await r.verify_replicas()
+        by = {x["server_id"]: x for x in report["replicas"]}
+
+        assert by["server3"]["reachable"] is False
+        assert report["all_in_sync"] is False
