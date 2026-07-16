@@ -171,9 +171,11 @@ class WALReplication:
     async def start(self):
         """Запуск репликации."""
         from cluster.auth import auth_headers
+        from cluster.faults import chaos_trace_configs
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=10),
             headers=auth_headers(self.secret),
+            trace_configs=chaos_trace_configs(),
         )
         self._running = True
 
