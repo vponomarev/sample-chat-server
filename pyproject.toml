@@ -4,9 +4,12 @@ testpaths = ["server/tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-addopts = "-v --tb=short"
+# По умолчанию исключаем integration: они поднимают реальные процессы-узлы и
+# чувствительны к нагрузке хоста (антивирус/ИБ-агент, параллельные тесты) —
+# в общем прогоне это давало ложные падения. Запуск явно: pytest -m integration.
+addopts = "-v --tb=short -m 'not integration'"
 markers = [
-    "integration: сквозные тесты, поднимающие реальные процессы (медленные; -m 'not integration' чтобы пропустить)",
+    "integration: сквозные тесты, поднимающие реальные процессы (медленные; запуск: -m integration)",
 ]
 
 [tool.coverage.run]

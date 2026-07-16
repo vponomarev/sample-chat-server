@@ -167,9 +167,11 @@ class BullyElection:
     async def start(self, http_app):
         """Запуск election менеджера."""
         from cluster.auth import auth_headers
+        from cluster.faults import chaos_trace_configs
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=5),
             headers=auth_headers(self.secret),
+            trace_configs=chaos_trace_configs(),
         )
         self._running = True
 
