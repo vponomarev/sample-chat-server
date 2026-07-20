@@ -55,6 +55,14 @@ DB_PATH = os.getenv("CHAT_DB_PATH", _DEFAULT_DB)
 LOG_LEVEL = os.getenv("LOG_LEVEL", _LOG.get("level", "INFO"))
 LOG_FORMAT = os.getenv("LOG_FORMAT", _LOG.get("format", "json"))
 
+# Rate limit сообщений: не более N за окно W секунд на подключение (issue #17).
+# Конфигурируемо, чтобы, например, нагрузочный тест (Этап 5.3) мог поднять лимит
+# и мерить пропускную способность без искусственных отказов anti-flood.
+RATE_LIMIT_MSGS = int(os.getenv("RATE_LIMIT_MSGS", _SRV.get("rate_limit_msgs", 10)))
+RATE_LIMIT_WINDOW_SEC = float(
+    os.getenv("RATE_LIMIT_WINDOW_SEC", _SRV.get("rate_limit_window_sec", 10))
+)
+
 # Имя сервера (для кластера)
 SERVER_ID = os.getenv("SERVER_ID", "server1")
 SERVER_NAME = os.getenv("SERVER_NAME", SERVER_ID)

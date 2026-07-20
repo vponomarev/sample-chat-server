@@ -16,9 +16,9 @@ MAX_MESSAGE_LEN = 4000
 MAX_NICK_LEN = 32
 MAX_ROOM_LEN = 64
 
-# Rate limit сообщений: не более N сообщений за окно W секунд на одно подключение
-RATE_LIMIT_MSGS = 10
-RATE_LIMIT_WINDOW_SEC = 10.0
+# Rate limit сообщений: не более N сообщений за окно W секунд на одно подключение.
+# Значения конфигурируемы (env/yaml) через config — см. config.RATE_LIMIT_*.
+from config import RATE_LIMIT_MSGS, RATE_LIMIT_WINDOW_SEC
 
 
 class CommandHandler:
