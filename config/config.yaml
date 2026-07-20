@@ -2,6 +2,11 @@
 server:
   host: "0.0.0.0"
   port: 8080
+  # CORS: разрешённые Origin через запятую или "*" (все). По умолчанию "*" —
+  # для локального стенда; в проде укажите конкретные домены (issue #16).
+  # Переопределяется переменной окружения CORS_ALLOWED_ORIGINS.
+  # cors_allowed_origins: "https://chat.example.com,https://admin.example.com"
+  cors_allowed_origins: "*"
 
 database:
   path: "./data/chat.db"

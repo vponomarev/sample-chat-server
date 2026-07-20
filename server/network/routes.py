@@ -7,29 +7,57 @@ from pathlib import Path
 from network.ws_handler import websocket_handler
 
 
-@web.middleware
-async def cors_middleware(request: web.Request, handler):
-    """CORS middleware для поддержки кросс-доменных запросов."""
-    # Обработка preflight запросов
-    if request.method == "OPTIONS":
-        return web.Response(
-            headers={
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+_CORS_METHODS = "GET, POST, PUT, DELETE, OPTIONS"
+_CORS_HEADERS = "Content-Type, Authorization"
+
+
+def make_cors_middleware(allowed_origins):
+    """
+    Создаёт CORS-middleware с настраиваемым allowlist (issue #16).
+
+    ``allowed_origins`` — список Origin или ``["*"]`` (все). При ``*`` возвращаем
+    ``Access-Control-Allow-Origin: *``. Иначе отражаем Origin запроса, только если
+    он в списке (и добавляем ``Vary: Origin``, чтобы кэши не смешивали ответы);
+    незнакомый Origin не получает CORS-заголовков — браузер сам заблокирует.
+    """
+    allow_all = "*" in allowed_origins
+    allowed = set(allowed_origins)
+
+    def _acao_for(request: web.Request):
+        if allow_all:
+            return "*"
+        origin = request.headers.get("Origin")
+        return origin if origin in allowed else None
+
+    @web.middleware
+    async def cors_middleware(request: web.Request, handler):
+        acao = _acao_for(request)
+
+        # Preflight
+        if request.method == "OPTIONS":
+            headers = {
+                "Access-Control-Allow-Methods": _CORS_METHODS,
+                "Access-Control-Allow-Headers": _CORS_HEADERS,
                 "Access-Control-Max-Age": "3600",
             }
-        )
-    
-    # Выполнение обработчика
-    response = await handler(request)
-    
-    # Добавление CORS заголовков
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    
-    return response
+            if acao:
+                headers["Access-Control-Allow-Origin"] = acao
+                if acao != "*":
+                    headers["Vary"] = "Origin"
+            return web.Response(headers=headers)
+
+        response = await handler(request)
+
+        if acao:
+            response.headers["Access-Control-Allow-Origin"] = acao
+            response.headers["Access-Control-Allow-Methods"] = _CORS_METHODS
+            response.headers["Access-Control-Allow-Headers"] = _CORS_HEADERS
+            if acao != "*":
+                response.headers["Vary"] = "Origin"
+
+        return response
+
+    return cors_middleware
 
 
 CLIENT_DIR = Path(__file__).parent.parent.parent / "client"
@@ -59,8 +87,9 @@ async def serve_favicon(request: web.Request) -> web.Response:
 
 def setup_routes(app: web.Application):
     """Настройка HTTP маршрутов."""
-    # Добавляем CORS middleware
-    app.middlewares.append(cors_middleware)
+    # CORS middleware с allowlist из конфигурации (issue #16)
+    from config import CORS_ALLOWED_ORIGINS
+    app.middlewares.append(make_cors_middleware(CORS_ALLOWED_ORIGINS))
     
     # WebSocket endpoint
     app.router.add_get("/ws", websocket_handler)

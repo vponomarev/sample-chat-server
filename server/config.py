@@ -51,6 +51,12 @@ PORT = int(os.getenv("CHAT_PORT", _SRV.get("port", 8080)))
 _DEFAULT_DB = _resolve_db_path(_DB["path"]) if _DB.get("path") else str(PROJECT_ROOT / "data" / "chat.db")
 DB_PATH = os.getenv("CHAT_DB_PATH", _DEFAULT_DB)
 
+# CORS: список разрешённых Origin через запятую или "*" (все). По умолчанию "*" —
+# удобно для локального стенда, но это осознанно широкая настройка (issue #16):
+# в проде указывают конкретные домены (env CORS_ALLOWED_ORIGINS или yaml).
+_CORS_RAW = os.getenv("CORS_ALLOWED_ORIGINS", _SRV.get("cors_allowed_origins", "*"))
+CORS_ALLOWED_ORIGINS = [o.strip() for o in str(_CORS_RAW).split(",") if o.strip()] or ["*"]
+
 # Логирование
 LOG_LEVEL = os.getenv("LOG_LEVEL", _LOG.get("level", "INFO"))
 LOG_FORMAT = os.getenv("LOG_FORMAT", _LOG.get("format", "json"))
